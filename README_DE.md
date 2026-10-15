@@ -15,6 +15,10 @@ Diese Mod bringt es auf **AMD-Radeon-RX-6000-Karten** (RDNA2).
 > **Experimentell.** Kann abstürzen, falsch aussehen oder viele FPS kosten. Nicht in Online-Spielen
 > mit Anti-Cheat benutzen.
 
+**Neu in v0.3:** bis zu 60 FPS ohne Frame Generation auf einer RX 6900 XT, gleichmäßige Frametimes, kein Stottern
+mehr in schnellen Spielen, HDR-Fix (keine weißen Figuren mehr), saubere 2 Durchgänge, sicheres Setup mit Backup und Deinstaller.
+Siehe [CHANGELOG.md](CHANGELOG.md).
+
 ## Geht das auf meinem PC?
 
 Du brauchst **alles** davon:
@@ -58,12 +62,24 @@ Wo du sie bekommst, steht in janblades Anleitung:
 
 ### Schritt 3: Spielordner finden
 
-Das ist der Ordner, in dem die `.exe` des Spiels liegt.
+Das ist der Ordner, in dem die **echte 64-Bit**-`.exe` des Spiels liegt, also die, die das Spiel wirklich startet.
+Das ist **nicht** immer der Hauptordner: Viele Spiele haben oben nur einen kleinen Launcher und die echte
+Spiel-`.exe` weiter unten.
 
 - **Steam:** Rechtsklick aufs Spiel → **Verwalten** → **Lokale Dateien durchsuchen**
 - **Epic / GOG / andere:** Rechtsklick aufs Spiel → Installationsordner öffnen
 
-Gibt es dort einen Ordner `bin` oder `Binaries\Win64` mit der `.exe` drin, nimm den.
+Schau zuerst in diese Unterordner. Liegt die Spiel-`.exe` in einem davon, nimm **diesen** Ordner:
+
+| Ordner-Muster | Beispiel |
+|---|---|
+| Hauptordner (kein Launcher) | `...\Fallout 4\` (mit `Fallout4.exe`) |
+| `bin\` oder `bin\x64\` | `...\Cyberpunk 2077\bin\x64\` (mit `Cyberpunk2077.exe`) |
+| `x64\` | `...\Spielname\x64\` |
+| `<Name>\Binaries\Win64\` (Unreal-Spiele) | `...\Jedi Survivor\SwGame\Binaries\Win64\` |
+
+Tipp: Spiel starten, Task-Manager → **Details**, Rechtsklick auf den Spielprozess → **Dateipfad öffnen**.
+Das ist genau der richtige Ordner. `setup_windows.bat` warnt, wenn im Ordner keine 64-Bit-`.exe` liegt.
 
 ### Schritt 4: Dateien kopieren
 
@@ -115,14 +131,15 @@ Der erste Start dauert ein paar Sekunden länger. Das ist normal.
 
 ## Deinstallieren
 
-Doppelklick im Spielordner auf **`Remove_OptiScaler.bat`**. Danach `nr_data`, `nr_runtime.dll`,
-`nr_port.ini` und `nvngx.dll_dlssnr.dll` löschen.
+Doppelklick im Spielordner auf **`Uninstall_DLSS5.bat`** und `1` drücken. Es entfernt OptiScaler und unsere Dateien
+(`nr_data`, `nr_runtime.dll`, `nr_port.ini`, `nvngx.dll_dlssnr.dll`, Logs) und stellt jede Datei wieder her, die
+`setup_windows.bat` ersetzt oder gelöscht hat (gesichert in `DLSS5_backup\`). Deine `nvngx_dlssnr.dll` bleibt.
 
 ## Wird das Spiel schneller oder langsamer?
 
-Langsamer. Die AMD-Karte muss Arbeit machen, für die NVIDIA-Karten Spezial-Hardware haben. Auf einer
-RX 6900 XT braucht ein Modell-Frame ca. 40 ms, kleinere Karten länger (siehe Tabelle oben). Rechne mit deutlich weniger FPS. Das ist eine Tech-Demo,
-keine Performance-Mod.
+Es kostet FPS, ist aber seit **v0.3** spielbar. Die AMD-Karte muss Arbeit machen, für die NVIDIA-Karten Spezial-Hardware haben.
+Mit den v0.3-Standardeinstellungen (Modell 960x540, Netz auf zwei Frames verteilt) schafft eine RX 6900 XT etwa **40-45 FPS,
+in leichteren Szenen bis zu 60 FPS, ohne Frame Generation** (Fallout 4, 1440p), mit gleichmäßigen Frametimes. Kleinere Karten sind langsamer (siehe Tabelle oben).
 
 ## Wer hat was gemacht?
 

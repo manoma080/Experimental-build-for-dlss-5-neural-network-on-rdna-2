@@ -1,4 +1,4 @@
-// test_sync <color.bin RGBA16F WxH> <dll dir> [frames]
+﻿// test_sync <color.bin RGBA16F WxH> <dll dir> [frames]
 // Plays the host for the sync path: one D3D12 direct queue; per frame ONE command list = upload this frame's colour ->
 // evaluate_v2 -> copy `output` to readback (the consumer sits in the same list, after evaluate, as in the game).
 // Every frame gets a different input (the base image shifted by 13 px per frame), so a stale or skipped result cannot match.
@@ -19,6 +19,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <thread>
 #include <d3dcompiler.h>
 #include "dlssnr_iface.h"
 #include "r11g10.h"
@@ -99,7 +101,12 @@ int main(int argc, char** argv) {
     { ID3D12CommandList* l[] = {cl}; q->ExecuteCommandLists(1, l); } if (!wait(5000)) { puts("FAIL timeout"); return 2; }
     if (!f) { printf("FAIL create: %s\n", err()); return 3; }
     char e2[512] = ""; void* ref = rcreate(dd, (int)MW, (int)MH, 1, e2, sizeof e2); if (!ref) { printf("FAIL reference nr_create: %s\n", e2); return 3; }
-    double t0 = now(); while (state(f) == 0 && now() - t0 < 90000) Sleep(50);
+    // NR_TEST_PASSES=2 (flicker mode): OptiScaler "2 passes" -- a second feature, evaluated in the same list on pass 1's output (janblade DlssNr_Dx12.cpp)
+    const bool two = getenv("NR_TEST_PASSES") && atoi(getenv("NR_TEST_PASSES")) > 1; void* f2 = nullptr; ID3D12Resource* out2 = nullptr;
+    if (two) { al->Reset(); cl->Reset(al, nullptr); f2 = create(L"nvngx_dlssnr.dll", L"data", dev, cl, nullptr, W, H, 0, 1.f, 0, 1.f, 1.f, 1.f, 0, 1); cl->Close();
+        { ID3D12CommandList* l[] = {cl}; q->ExecuteCommandLists(1, l); } if (!wait(5000) || !f2) { printf("FAIL create pass 2: %s\n", err()); return 3; }
+        out2 = tex(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, OFMT); }
+    double t0 = now(); while ((state(f) == 0 || (f2 && state(f2) == 0)) && now() - t0 < 90000) Sleep(50);
     printf("dll state %d after %.0f ms (5 = sync)\n", state(f), now() - t0); if (state(f) != 5) { printf("FAIL sync path not active: %s\n", err()); return 4; }
     printf("device after create: 0x%08lx\n", (unsigned long)dev->GetDeviceRemovedReason());
 
@@ -112,11 +119,11 @@ int main(int argc, char** argv) {
     auto makeFrame = [&](int k) {   // shifted base image -> texture format bytes in upload, and the exact half4 the network sees in `in`
         const int sx = (int)(((long long)k * DX % MW + MW) % MW), sy = (int)(((long long)k * DY % MH + MH) % MH);
         for (UINT y = 0; y < H; y++) for (UINT x = 0; x < W; x++) {
-            const UINT bx = x / UP, by = y / UP; const bool ob = inObj(k, bx, by);
+            const UINT bx = x * MW / W, by = y * MH / H; const bool ob = inObj(k, bx, by);   // frame -> model-size source (any frame size)
             const uint16_t* s = OBJ ? (ob ? &base[((size_t)(by - oy + MH / 2) * MW + (bx - objX(k) + MW / 2)) * 4] : &base[((size_t)by * MW + bx) * 4])
                                     : &base[((size_t)((by + sy) % MH) * MW + (bx + sx) % MW) * 4];
-            { float mv[2] = { OBJ ? (ob ? (float)DX : 0.f) : (float)DX, OBJ ? 0.f : (float)DY }; uint16_t hv[2] = { f2h(mv[0] / W), f2h(mv[1] / H) }; memcpy(mvp + (size_t)y * gpitch + x * 4, hv, 4);
-              float dv = OBJ && ob ? 0.5f : 0.1f; memcpy(dpp + (size_t)y * gpitch + x * 4, &dv, 4); } uint16_t* d = &in[((size_t)(y / UP) * MW + x / UP) * 4];
+            { float mv[2] = { OBJ ? (ob ? (float)DX : 0.f) : (float)DX, OBJ ? 0.f : (float)DY }; uint16_t hv[2] = { f2h(mv[0] / MW), f2h(mv[1] / MH) }; memcpy(mvp + (size_t)y * gpitch + x * 4, hv, 4);
+              float dv = OBJ && ob ? 0.5f : 0.1f; memcpy(dpp + (size_t)y * gpitch + x * 4, &dv, 4); } uint16_t* d = &in[((size_t)by * MW + bx) * 4];
             if (r11) { uint32_t v; pack_r11g11b10(s, &v); memcpy(upp + (size_t)y * pitch + x * 4, &v, 4); unpack_r11g11b10(v, d); }
             else if (e5) { uint32_t v = pk5(s); memcpy(upp + (size_t)y * pitch + x * 4, &v, 4); up5(v, d); }
             else if (NOISE > 0) { uint16_t t[4]; for (int c = 0; c < 4; c++) { uint32_t hsh = (uint32_t)(k * 73856093) ^ (x * 19349663u) ^ (y * 83492791u) ^ (c * 2654435761u); hsh ^= hsh >> 13; hsh *= 0x5bd1e995u; hsh ^= hsh >> 15;
@@ -133,8 +140,12 @@ int main(int argc, char** argv) {
         bar(color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST); { auto d = ts(color), s = fp(up, pitch, FMT); cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr); }
         bar(color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         int r = k < 0 ? 1 : eval(cl, f, nullptr, color, fdp, fmv, out, W, H, W, H, W, H, 0, 0, 0, 0, fmv ? 1 : 0, k == 0, 1.f, 0, 1.f, 1.f, 1.f, 0, fmv ? (float)W : 1.f, fmv ? (float)H : 1.f);
-        bar(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE); { auto d = fp(rb, opitch, OFMT), s = ts(out); cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr); }
-        bar(out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); cl->Close();
+        ID3D12Resource* fin_ = out;
+        if (f2 && k >= 0) { bar(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);   // pass 2: pass 1's output is the input
+            int r2 = eval(cl, f2, nullptr, out, fdp, fmv, out2, W, H, W, H, W, H, 0, 0, 0, 0, fmv ? 1 : 0, k == 0, 1.f, 0, 1.f, 1.f, 1.f, 0, fmv ? (float)W : 1.f, fmv ? (float)H : 1.f);
+            bar(out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); if (r2 != 1) r = r2; fin_ = out2; }
+        bar(fin_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE); { auto d = fp(rb, opitch, OFMT), s = ts(fin_); cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr); }
+        bar(fin_, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); cl->Close();
         if (!exec) return r;                                  // the host dropped this list
         double a = now(); ID3D12CommandList* l[] = {cl}; q->ExecuteCommandLists(1, l); if (!wait(5000)) return -100; *ms = now() - a; return r; };
     double se_o = 0, se_i = 0; auto psnr = [&](double se) { return 10 * log10(3.0 * MW * MH / std::max(se, 1e-12)); };
@@ -152,9 +163,9 @@ int main(int argc, char** argv) {
                 if (e > *maxerr) *maxerr = e; if (e > 0.004 + (r11 ? 0.035 : 0.004) * fabs(bv)) (*beyond)++; } } };   // r11: 5-6 bit mantissa
 
     if (getenv("NR_TEST_PACE")) {   // pacing: a game submitting every NR_TEST_CPU_MS with up to 2 frames queued; frame time = gap between GPU completions
-        const int n = atoi(getenv("NR_TEST_PACE")); const double cpu = getenv("NR_TEST_CPU_MS") ? atof(getenv("NR_TEST_CPU_MS")) : 8.0;
+        const int n = atoi(getenv("NR_TEST_PACE")); const int QD = getenv("NR_TEST_QUEUE") ? std::max(1, std::min(7, atoi(getenv("NR_TEST_QUEUE")))) : 2, NQ = QD + 1; const double cpu = getenv("NR_TEST_CPU_MS") ? atof(getenv("NR_TEST_CPU_MS")) : 8.0;
         auto stats = (void (*)(void*, unsigned*, unsigned*, unsigned*))GetProcAddress(m, "dlssnr_port_stats"); if (!stats) { puts("missing dlssnr_port_stats"); return 1; }
-        ID3D12CommandAllocator* A[3]; ID3D12GraphicsCommandList* L[3]; for (int i = 0; i < 3; i++) { CK(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&A[i]))); CK(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, A[i], nullptr, IID_PPV_ARGS(&L[i]))); L[i]->Close(); }
+        ID3D12CommandAllocator* A[8]; ID3D12GraphicsCommandList* L[8]; for (int i = 0; i < NQ; i++) { CK(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&A[i]))); CK(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, A[i], nullptr, IID_PPV_ARGS(&L[i]))); L[i]->Close(); }
         const double gms = getenv("NR_TEST_GPU_MS") ? atof(getenv("NR_TEST_GPU_MS")) : 0; ID3D12RootSignature* lrs = nullptr; ID3D12PipelineState* lps = nullptr; ID3D12Resource* lb = nullptr; UINT lit = 20000;
         if (gms > 0) {   // dummy "game rendering": an ALU loop over 4096x64 threads, iteration count calibrated to gms (from branch pipeline)
             const char* hl = "RWByteAddressBuffer u : register(u0); cbuffer C : register(b0) { uint n; };\n"
@@ -172,42 +183,45 @@ int main(int argc, char** argv) {
                 printf("gpu load calibration: %u iterations -> %.2f ms\n", lit, t); if (it < 3) lit = (UINT)std::min(5e7, std::max(1000.0, lit * gms / std::max(t, 0.05))); }
         }
         auto gtex = [&](DXGI_FORMAT fm) { auto r = tex(D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON, fm); return r; };
-        ID3D12Resource *mvt = gtex(DXGI_FORMAT_R16G16_FLOAT), *dpt = gtex(DXGI_FORMAT_R32_FLOAT), *mu[3], *du[3]; uint8_t *mup[3], *dup[3];
-        for (int i = 0; i < 3; i++) { mu[i] = buf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)gpitch * H, D3D12_RESOURCE_STATE_GENERIC_READ); du[i] = buf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)gpitch * H, D3D12_RESOURCE_STATE_GENERIC_READ); mu[i]->Map(0, nullptr, (void**)&mup[i]); du[i]->Map(0, nullptr, (void**)&dup[i]); }
+        ID3D12Resource *mvt = gtex(DXGI_FORMAT_R16G16_FLOAT), *dpt = gtex(DXGI_FORMAT_R32_FLOAT), *mu[8], *du[8]; uint8_t *mup[8], *dup[8];
+        for (int i = 0; i < NQ; i++) { mu[i] = buf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)gpitch * H, D3D12_RESOURCE_STATE_GENERIC_READ); du[i] = buf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)gpitch * H, D3D12_RESOURCE_STATE_GENERIC_READ); mu[i]->Map(0, nullptr, (void**)&mup[i]); du[i]->Map(0, nullptr, (void**)&dup[i]); }
         mvp = mup[0]; dpp = dup[0];
-        makeFrame(0); memcpy(mup[1], mup[0], (size_t)gpitch * H); memcpy(dup[1], dup[0], (size_t)gpitch * H); memcpy(mup[2], mup[0], (size_t)gpitch * H); memcpy(dup[2], dup[0], (size_t)gpitch * H);
+        makeFrame(0); for (int i = 1; i < NQ; i++) { memcpy(mup[i], mup[0], (size_t)gpitch * H); memcpy(dup[i], dup[0], (size_t)gpitch * H); }
         bool gfirst = true; std::vector<double> done; std::vector<UINT64> fvs; unsigned n0, b0, r0; stats(f, &n0, &b0, &r0);
         // NR_TEST_GHOST=1: the image moves (makeFrame(k) shift) every frame; reused frames are compared with the reference NR of the SAME frame
-        const bool ghost = getenv("NR_TEST_GHOST") && UP == 1 && !r11; ID3D12Resource *gu[3] = {}, *gr[3] = {}; uint8_t *gup[3] = {}, *grp[3] = {};
+        const bool ghost = getenv("NR_TEST_GHOST") && UP == 1 && !r11; ID3D12Resource *gu[8] = {}, *gr[8] = {}; uint8_t *gup[8] = {}, *grp[8] = {};
         std::vector<int> greu(n, 0); std::vector<std::vector<uint16_t>> gout(n); ID3D12Resource* up0 = up; uint8_t* upp0 = upp;
-        if (ghost) for (int i = 0; i < 3; i++) { gu[i] = buf(D3D12_HEAP_TYPE_UPLOAD, sz, D3D12_RESOURCE_STATE_GENERIC_READ); gr[i] = buf(D3D12_HEAP_TYPE_READBACK, (UINT64)opitch * H, D3D12_RESOURCE_STATE_COPY_DEST); gu[i]->Map(0, nullptr, (void**)&gup[i]); gr[i]->Map(0, nullptr, (void**)&grp[i]); }
-        auto grab = [&](int j) { if (!ghost || j < 0 || !greu[j]) return; auto& o = gout[j]; o.resize((size_t)W * H * 4); for (UINT y = 0; y < H; y++) memcpy(&o[(size_t)y * W * 4], grp[j % 3] + (size_t)y * opitch, (size_t)W * 8); };
+        if (ghost) for (int i = 0; i < NQ; i++) { gu[i] = buf(D3D12_HEAP_TYPE_UPLOAD, sz, D3D12_RESOURCE_STATE_GENERIC_READ); gr[i] = buf(D3D12_HEAP_TYPE_READBACK, (UINT64)opitch * H, D3D12_RESOURCE_STATE_COPY_DEST); gu[i]->Map(0, nullptr, (void**)&gup[i]); gr[i]->Map(0, nullptr, (void**)&grp[i]); }
+        auto grab = [&](int j) { if (!ghost || j < 0 || !greu[j]) return; auto& o = gout[j]; o.resize((size_t)W * H * 4); for (UINT y = 0; y < H; y++) memcpy(&o[(size_t)y * W * 4], grp[j % NQ] + (size_t)y * opitch, (size_t)W * 8); };
         auto waitFv = [&](UINT64 v) { if (fence->GetCompletedValue() >= v) return true; fence->SetEventOnCompletion(v, ev); return WaitForSingleObject(ev, 5000) == WAIT_OBJECT_0; };
         auto poll = [&]() { while (done.size() < fvs.size() && fence->GetCompletedValue() >= fvs[done.size()]) done.push_back(now()); };
+        // completion times from a poller thread: the DLL may block the submit thread (busy_mode=wait), which must not skew the GPU frame times
+        const UINT64 fv0 = fv; std::vector<double> tv(n, 0); std::atomic<bool> prun{true};
+        std::thread pt([&] { UINT64 seen = fv0; while (prun) { UINT64 c = fence->GetCompletedValue(); const double t = now(); while (seen < c && seen - fv0 < (UINT64)n) tv[(++seen) - fv0 - 1] = t; Sleep(0); } });
         double next = now();
         for (int k = 0; k < n; k++) {
             while (now() < next) { poll(); Sleep(0); } next = now() + cpu;   // game CPU time per frame
-            if (k >= 2) { if (!waitFv(fvs[k - 2])) { puts("FAIL pace: GPU wait timed out"); return 7; } poll(); grab(k - 2); }   // swapchain: at most 2 frames queued
-            if (ghost) { up = gu[k % 3]; upp = gup[k % 3]; mvp = mup[k % 3]; dpp = dup[k % 3]; makeFrame(k); }
-            auto* c = L[k % 3]; A[k % 3]->Reset(); c->Reset(A[k % 3], nullptr); std::swap(cl, c);
+            if (k >= QD) { if (!waitFv(fvs[k - QD])) { prun = false; pt.join(); puts("FAIL pace: GPU wait timed out"); return 7; } poll(); grab(k - QD); }   // swapchain: at most QD frames queued (NR_TEST_QUEUE, default 2)
+            if (ghost) { up = gu[k % NQ]; upp = gup[k % NQ]; mvp = mup[k % NQ]; dpp = dup[k % NQ]; makeFrame(k); }
+            auto* c = L[k % NQ]; A[k % NQ]->Reset(); c->Reset(A[k % NQ], nullptr); std::swap(cl, c);
             bar(color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST); { auto d = ts(color), s = fp(up, pitch, FMT); cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr); }
             bar(color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             for (int g = 0; g < 2; g++) { ID3D12Resource* t = g ? dpt : mvt; DXGI_FORMAT fm = g ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R16G16_FLOAT;   // guides: upload -> texture -> shader resource
                 bar(t, gfirst ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-                D3D12_TEXTURE_COPY_LOCATION s0 = {}; s0.pResource = g ? du[k % 3] : mu[k % 3]; s0.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; s0.PlacedFootprint.Footprint = {fm, W, H, 1, gpitch};
+                D3D12_TEXTURE_COPY_LOCATION s0 = {}; s0.pResource = g ? du[k % NQ] : mu[k % NQ]; s0.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; s0.PlacedFootprint.Footprint = {fm, W, H, 1, gpitch};
                 auto d0 = ts(t); cl->CopyTextureRegion(&d0, 0, 0, 0, &s0, nullptr); bar(t, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE); } gfirst = false;
             if (lps) { cl->SetComputeRootSignature(lrs); cl->SetPipelineState(lps); cl->SetComputeRoot32BitConstants(0, 1, &lit, 0); cl->SetComputeRootUnorderedAccessView(1, lb->GetGPUVirtualAddress()); cl->Dispatch(4096, 1, 1);
                        D3D12_RESOURCE_BARRIER ub = {}; ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; cl->ResourceBarrier(1, &ub); }
             unsigned x1, x2, ru0, ru1; stats(f, &x1, &x2, &ru0);
             eval(cl, f, nullptr, color, dpt, mvt, out, W, H, W, H, W, H, 0, 0, 0, 0, 1, k == 0, 1.f, 0, 1.f, 1.f, 1.f, 0, (float)W, (float)H);
             stats(f, &x1, &x2, &ru1); greu[k] = ru1 != ru0;
-            if (ghost) { bar(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE); { auto d = fp(gr[k % 3], opitch, OFMT), s = ts(out); cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr); }
+            if (ghost) { bar(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE); { auto d = fp(gr[k % NQ], opitch, OFMT), s = ts(out); cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr); }
                          bar(out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); }
             cl->Close();
             ID3D12CommandList* l[] = {cl}; q->ExecuteCommandLists(1, l); q->Signal(fence, ++fv); fvs.push_back(fv); std::swap(cl, c); poll();
         }
-        if (!waitFv(fvs.back())) { puts("FAIL pace: GPU wait timed out"); return 7; } poll(); while (done.size() < fvs.size()) done.push_back(now());
-        for (int j = std::max(0, n - 2); j < n; j++) grab(j);
+        if (!waitFv(fvs.back())) { prun = false; pt.join(); puts("FAIL pace: GPU wait timed out"); return 7; } prun = false; pt.join(); done = tv;
+        for (int j = std::max(0, n - QD); j < n; j++) grab(j);
         if (ghost) {   // ghosting: mean |out - refNR(same frame)| over reused frames; "live" = the plain live frame for scale
             double e = 0, el = 0, er = 0, erl = 0; size_t cnt = 0, cr = 0; int nf = 0; up = up0; upp = upp0; mvp = mvScratch.data(); dpp = dScratch.data();
             for (int j = 0; j < n; j++) { if (gout[j].empty()) continue; makeFrame(j); float gms; if (rrun(ref, in.data(), refo.data(), &gms)) { puts("FAIL reference nr_run"); return 6; } nf++;
@@ -218,7 +232,8 @@ int main(int argc, char** argv) {
             if (OBJ) printf("ghost object region (object now or one frame ago): %.5f (live %.5f)\n", cr ? er / cr : 0, cr ? erl / cr : 0);
         }
         std::vector<double> d; for (size_t i = 10; i < done.size(); i++) d.push_back(done[i] - done[i - 1]);   // skip warm-up
-        double s = 0, s2 = 0; for (double x : d) { s += x; s2 += x * x; } double av = s / d.size(), sd = sqrt(std::max(0.0, s2 / d.size() - av * av)); std::sort(d.begin(), d.end());
+        double s = 0, s2 = 0, oe[2] = {}; for (size_t i = 0; i < d.size(); i++) { s += d[i]; s2 += d[i] * d[i]; oe[(i + 11) & 1] += d[i]; } double av = s / d.size(), sd = sqrt(std::max(0.0, s2 / d.size() - av * av));
+        printf("pace odd/even: frame time odd %.2f even %.2f |diff| %.2f ms\n", oe[1] / (d.size() / 2), oe[0] / ((d.size() + 1) / 2), fabs(oe[1] / (d.size() / 2) - oe[0] / ((d.size() + 1) / 2))); std::sort(d.begin(), d.end());
         unsigned n1, b1, r1; stats(f, &n1, &b1, &r1);
         printf("pace (gpu load %.1f ms) ", gms);
         printf("pace (cpu %.1f ms/frame, %d frames): frame time avg %.2f ms (%.1f fps) sd %.2f p50 %.2f p95 %.2f p99 %.2f max %.2f | NR %u, reused %u, native %u\n",
@@ -265,6 +280,54 @@ int main(int argc, char** argv) {
         printf("HIST list ms p50 %.2f\n", tl[tl.size() / 2]);
         release(f); return 0;
     }
+    if (getenv("NR_TEST_HDR")) {   // HDR white-out test (RE Engine-like scene-linear colour): NR_TEST_HDR=frames, frame W x H (NR_TEST_FW/FH), source NR_TEST_SW x SH.
+        // Scene: the source (display sRGB) decoded to linear x NR_TEST_EXP (default 3), a 5..50 light strip at the top, four skin-like patches (~1.5..4).
+        // Static sequence; NR_TEST_PASSES=2 evaluates twice per frame (output -> input, as OptiScaler Passes=2). Last frame: white-out = share of
+        // pixels whose luma rises above 1.5 x input + 0.05 (linear), and in display space P = sRGB(x/(1+x)): share with P(out) - P(in) > 0.1.
+        // NR_TEST_HDRDUMP=prefix: writes prefix_in.ppm / prefix_out.ppm (P-tonemapped, 8 bit) for viewing.
+        const int n = atoi(getenv("NR_TEST_HDR")), passes = getenv("NR_TEST_PASSES") ? atoi(getenv("NR_TEST_PASSES")) : 1; const float ex = getenv("NR_TEST_EXP") ? (float)atof(getenv("NR_TEST_EXP")) : 3.f;
+        auto P = [](double x) { x = std::max(x, 0.0); x = x / (1 + x); return x <= 0.0031308 ? 12.92 * x : 1.055 * pow(x, 1 / 2.4) - 0.055; };
+        auto lin = [](double v) { v = std::min(std::max(v, 0.0), 1.0); return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4); };
+        std::vector<float> hin((size_t)W * H * 3); std::vector<char> skin((size_t)W * H);
+        const float sk[4][3] = {{0.30f, 0.30f, 0.12f}, {0.62f, 0.45f, 0.10f}, {0.45f, 0.70f, 0.14f}, {0.80f, 0.75f, 0.09f}};   // centre u, v, radius (fraction of H)
+        for (UINT y = 0; y < H; y++) for (UINT x = 0; x < W; x++) { const size_t i = (size_t)y * W + x; const UINT sx = x * SW / W, sy = y * SH / H; float l = 0;
+            for (int c = 0; c < 3; c++) { hin[i * 3 + c] = ex * (float)lin(h2f(base[((size_t)sy * SW + sx) * 4 + c])); l += hin[i * 3 + c] / 3; }
+            if (y < H / 8) { const float v = 5.f + 45.f * x / W; for (int c = 0; c < 3; c++) hin[i * 3 + c] = v * (c == 2 ? 0.8f : 1.f) * (0.8f + 0.4f * l / ex); }
+            for (auto& s : sk) { const float du = (x + .5f) / H - s[0] * W / H, dv = (y + .5f) / H - s[1]; if (du * du + dv * dv < s[2] * s[2]) { const float k = 1.5f + 2.5f * (1 - sqrtf(du * du + dv * dv) / s[2]) * (0.7f + 0.6f * std::min(l / ex, 1.f));
+                hin[i * 3] = 1.0f * k; hin[i * 3 + 1] = 0.66f * k; hin[i * 3 + 2] = 0.5f * k; skin[i] = 1; } } }
+        for (UINT y = 0; y < H; y++) for (UINT x = 0; x < W; x++) { uint16_t h4[4]; float* p = &hin[((size_t)y * W + x) * 3]; for (int c = 0; c < 3; c++) h4[c] = f2h(p[c]); h4[3] = f2h(1.f);
+            if (e5) { uint32_t v = pk5(h4); memcpy(upp + (size_t)y * pitch + x * 4, &v, 4); up5(v, h4); } else if (r11) { uint32_t v; pack_r11g11b10(h4, &v); memcpy(upp + (size_t)y * pitch + x * 4, &v, 4); unpack_r11g11b10(v, h4); }
+            else memcpy(upp + (size_t)y * pitch + x * 8, h4, 8);
+            for (int c = 0; c < 3; c++) p[c] = (float)h2f(h4[c]); }   // what the DLL really gets
+        ID3D12Resource* out2 = passes > 1 ? tex(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, OFMT) : nullptr;
+        for (int k = 0; k < n; k++) {
+            al->Reset(); cl->Reset(al, nullptr);
+            bar(color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST); { auto d = ts(color), s = fp(up, pitch, FMT); cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr); }
+            bar(color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            int r = eval(cl, f, nullptr, color, nullptr, nullptr, out, W, H, W, H, W, H, 0, 0, 0, 0, 0, k == 0, 1.f, 0, 1.f, 1.f, 1.f, 0, 1.f, 1.f); ID3D12Resource* last = out;
+            if (passes > 1) { bar(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                r &= eval(cl, f, nullptr, out, nullptr, nullptr, out2, W, H, W, H, W, H, 0, 0, 0, 0, 0, 0, 1.f, 0, 1.f, 1.f, 1.f, 0, 1.f, 1.f);
+                bar(out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); last = out2; }
+            bar(last, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE); { auto d = fp(rb, opitch, OFMT), s = ts(last); cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr); }
+            bar(last, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); cl->Close();
+            ID3D12CommandList* l[] = {cl}; q->ExecuteCommandLists(1, l); if (!wait(5000)) { printf("FAIL frame %d: GPU wait timed out\n", k); return 7; }
+            if (r != 1) { printf("FAIL frame %d: evaluate returned %d\n", k, r); return 9; }
+            size_t wo = 0, wp = 0, sw = 0, ns = 0; double dp = 0, mx = 0, so = 0, si = 0;
+            for (size_t i = 0; i < (size_t)W * H; i++) { const size_t y = i / W, x = i % W; uint16_t o[4]; if (r11) unpack_r11g11b10(*(uint32_t*)(rbp + y * pitch + x * 4), o); else memcpy(o, rbp + y * opitch + x * 8, 8);
+                double lo = 0, li = 0; for (int c = 0; c < 3; c++) { const double wl = c == 0 ? .2126 : c == 1 ? .7152 : .0722, v = h2f(o[c]); lo += wl * (v == v ? v : 1e9); li += wl * hin[i * 3 + c]; }
+                const bool w1 = lo > 1.5 * li + 0.05, w2 = P(lo) - P(li) > 0.1; wo += w1; wp += w2; dp += fabs(P(lo) - P(li)); mx = std::max(mx, lo);
+                if (skin[i]) { ns++; sw += w2; so += lo; si += li; } }
+            const double N = (double)W * H;
+            if (k < 2 || k == n - 1) printf("HDR frame %d (passes %d): white-out (lin) %.3f%%, white-out (display) %.3f%%, mean |dP| %.5f, max luma %.1f | skin: white-out %.3f%%, mean luma out/in %.3f\n",
+                                            k, passes, 100 * wo / N, 100 * wp / N, dp / N, mx, 100.0 * sw / std::max<size_t>(ns, 1), so / std::max(si, 1e-9));
+            if (k == n - 1 && getenv("NR_TEST_HDRDUMP")) for (int g = 0; g < 2; g++) { std::string fn = std::string(getenv("NR_TEST_HDRDUMP")) + (g ? "_out.ppm" : "_in.ppm"); FILE* pf = fopen(fn.c_str(), "wb"); if (!pf) continue;
+                fprintf(pf, "P6\n%u %u\n255\n", W, H); std::vector<uint8_t> row((size_t)W * 3);
+                for (UINT y = 0; y < H; y++) { for (UINT x = 0; x < W; x++) { uint16_t o[4]; if (r11) unpack_r11g11b10(*(uint32_t*)(rbp + (size_t)y * pitch + x * 4), o); else memcpy(o, rbp + (size_t)y * opitch + x * 8, 8);
+                    for (int c = 0; c < 3; c++) { double v = g ? h2f(o[c]) : hin[((size_t)y * W + x) * 3 + c]; row[x * 3 + c] = (uint8_t)std::min(255.0, P(v == v ? v : 1e9) * 255 + .5); } } fwrite(row.data(), 1, row.size(), pf); }
+                fclose(pf); }
+        }
+        release(f); return 0;
+    }
     if (fl) {   // NR_TEST_FW/FH: temporal flicker test at any frame size (frame W x H, network MW x MH). See HARNESS.md (handover/temporal-2026-10-11).
         // Sequence (a game-like camera): the source texture (argv[1], NR_TEST_SW x NR_TEST_SH, default the model size) bilinear-resampled to the
         // frame with a pan of NR_TEST_VX/VY frame px per frame (default 0.37, 0.13), TAA-like sub-pixel jitter (Halton 2,3, amplitude NR_TEST_JIT px,
@@ -307,7 +370,7 @@ int main(int argc, char** argv) {
         fmu = buf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)gpitch * H, D3D12_RESOURCE_STATE_GENERIC_READ); fdu = buf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)gpitch * H, D3D12_RESOURCE_STATE_GENERIC_READ);
         if (!fmv || !fdp || !fmu || !fdu) { puts("FAIL guide resources"); return 1; } fmu->Map(0, nullptr, (void**)&mvp); fdu->Map(0, nullptr, (void**)&dpp);
         std::vector<float> fin((size_t)W * H * 3), fout(fin.size()), pin(fin.size()), pout(fin.size()), mi((size_t)MW * MH * 3), mo(mi.size()), pmi(mi.size()), pmo(mi.size());
-        Fr tot, rtot; int nf = 0;
+        double hfo = 0, hfi = 0; int nhf = 0; Fr tot, rtot; int nf = 0; double pulse[2] = {}; int npulse[2] = {}; uint64_t hsh = 1469598103934665603ull;
         for (int k = 0; k < frames; k++) {
             gen(fin, W, H, k); float a[2], b[2]; shift(k, a); shift(k - 1, b); const uint16_t hv[2] = { f2h((a[0] - b[0]) / W), f2h((a[1] - b[1]) / H) }; const float dv = 0.1f;
             for (UINT y = 0; y < H; y++) for (UINT x = 0; x < W; x++) { memcpy(mvp + (size_t)y * gpitch + x * 4, hv, 4); memcpy(dpp + (size_t)y * gpitch + x * 4, &dv, 4);
@@ -318,16 +381,28 @@ int main(int argc, char** argv) {
             int r = frame(k, true, &ms); if (r == -100) { printf("FAIL frame %d: GPU wait timed out\n", k); return 7; } if (r != 1) { printf("FAIL frame %d: evaluate returned %d\n", k, r); return 7; }
             for (UINT y = 0; y < H; y++) for (UINT x = 0; x < W; x++) { uint16_t o[4]; if (r11) unpack_r11g11b10(*(uint32_t*)(rbp + (size_t)y * pitch + x * 4), o); else memcpy(o, rbp + (size_t)y * opitch + x * 8, 8);
                 for (int c = 0; c < 3; c++) { double v = h2f(o[c]); fout[((size_t)y * W + x) * 3 + c] = v == v ? (float)v : 0.f; } }
+            { double e = 0; for (size_t i = 0; i < fin.size(); i += 3) for (int c = 0; c < 3; c++) e += (c == 0 ? .2126 : c == 1 ? .7152 : .0722) * (std::min(std::max(fout[i + c], 0.f), 1.f) - std::min(std::max(fin[i + c], 0.f), 1.f));
+              uint64_t fh = 1469598103934665603ull; for (float v : fout) { uint32_t b; memcpy(&b, &v, 4); hsh = (hsh ^ b) * 1099511628211ull; fh = (fh ^ b) * 1099511628211ull; }   // output hash over all frames (bit-exactness between builds)
+              if (k >= frames - 4) printf("FHASH %d %016llx\n", k, (unsigned long long)fh);   // per frame (static sequences: split vs non-split once settled)
+              if (k > 0) pulse[k & 1] += e / (fin.size() / 3), npulse[k & 1]++; }   // odd/even pulsing: mean luma edit (out - in, display) per frame parity
             if (doRef) { gen(mi, MW, MH, k); for (size_t i = 0; i < (size_t)MW * MH; i++) { for (int c = 0; c < 3; c++) { in[i * 4 + c] = f2h(std::min(std::max(mi[i * 3 + c], 0.f), 1.f)); mi[i * 3 + c] = (float)h2f(in[i * 4 + c]); } in[i * 4 + 3] = f2h(1.f); }
                 float gms; if (rrun(ref, in.data(), refo.data(), &gms)) { puts("FAIL reference nr_run"); return 6; }
                 for (size_t i = 0; i < (size_t)MW * MH; i++) for (int c = 0; c < 3; c++) { uint16_t v = refo[i * 4 + c]; mo[i * 3 + c] = (v & 0x7C00) == 0x7C00 ? 0.f : (float)h2f(v); }
                 if (dumpDir) { char fn[1024]; for (int q = 0; q < 2; q++) { snprintf(fn, sizeof fn, "%s\\f%03d_%s.bin", dumpDir, k, q ? "out" : "in"); FILE* df = fopen(fn, "wb"); if (df) { fwrite(q ? mo.data() : mi.data(), 4, mi.size(), df); fclose(df); } } } }
+            { auto hf = [&](const std::vector<float>& v) { double s = 0; for (UINT y = 8; y < H - 8; y++) for (UINT x = 8; x < W - 8; x++) { auto L = [&](UINT xx, UINT yy) { const float* p = &v[((size_t)yy * W + xx) * 3];
+                    return .2126f * std::min(std::max(p[0], 0.f), 1.f) + .7152f * std::min(std::max(p[1], 0.f), 1.f) + .0722f * std::min(std::max(p[2], 0.f), 1.f); };
+                    s += fabs(4 * L(x, y) - L(x - 1, y) - L(x + 1, y) - L(x, y - 1) - L(x, y + 1)); } return s / ((double)(W - 16) * (H - 16)); };   // high-frequency energy: mean |Laplacian| of display luma
+              if (k >= 4) { hfo += hf(fout); hfi += hf(fin); nhf++; }
+              if (k == frames - 1 && getenv("NR_TEST_DUMP")) { for (int q = 0; q < 2; q++) { std::string fn = std::string(getenv("NR_TEST_DUMP")) + (q ? "_out.bin" : "_in.bin"); FILE* df = fopen(fn.c_str(), "wb"); if (df) { fwrite(q ? fout.data() : fin.data(), 4, fin.size(), df); fclose(df); } } } }
             if (k > 0) { Fr e = measure(fin, fout, pin, pout, W, H, k); tot.o += e.o; tot.i += e.i; tot.j += e.j; tot.v += e.v; tot.n += e.n; nf++; Fr er;
                 if (doRef) { er = measure(mi, mo, pmi, pmo, MW, MH, k); rtot.o += er.o; rtot.i += er.i; rtot.j += er.j; rtot.v += er.v; rtot.n += er.n; }
                 if (k < 4 || k % 10 == 0) printf("frame %d: inst out %.5f in %.5f, white jumps %zu%s\n", k, e.o, e.i, e.j, doRef ? (std::string(" | network alone: inst out ") + std::to_string(er.o) + " in " + std::to_string(er.i) + ", jumps " + std::to_string(er.j)).c_str() : ""); }
             std::swap(fin, pin); std::swap(fout, pout); std::swap(mi, pmi); std::swap(mo, pmo); }
+        printf("OUTHASH %016llx\n", (unsigned long long)hsh);
+        printf("PULSE mean luma edit odd %+.5f even %+.5f |diff| %.5f\n", pulse[1] / std::max(npulse[1], 1), pulse[0] / std::max(npulse[0], 1), fabs(pulse[1] / std::max(npulse[1], 1) - pulse[0] / std::max(npulse[0], 1)));
+        printf("HF mean |Laplacian| luma: out %.5f in %.5f (x%.3f) over %d frames\n", hfo / std::max(nhf, 1), hfi / std::max(nhf, 1), hfi > 0 ? hfo / hfi : 0, nhf);
         report("FLICKER frame", tot, nf, W, H); if (doRef) report("FLICKER network-alone", rtot, nf, MW, MH);
-        release(f); return 0;
+        if (f2) release(f2); release(f); return 0;
     }
     // baseline: the same list without evaluate
     std::vector<double> tb, ts_, tr; double ms = 0;
