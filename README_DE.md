@@ -15,6 +15,18 @@ Diese Mod bringt es auf **AMD-Radeon-RX-6000-Karten** (RDNA2).
 > **Experimentell.** Kann abstürzen, falsch aussehen oder viele FPS kosten. Nicht in Online-Spielen
 > mit Anti-Cheat benutzen.
 
+**Neu in v0.4:**
+- **NVIDIAs neues DLSS-5-Modell** (nvngx_dlssnr.dll 310.9.16) wird automatisch genutzt: etwa **halb so schwer**, ~10 ms pro Netz-Durchlauf bei 960x540 auf einer RX 6900 XT (v0.3: 24 ms). Die alte 310.8 läuft weiter mit dem alten Modell.
+- **Cyberpunk 2077, 1440p, FSR Qualität, ohne Frame Generation, RX 6900 XT:** 54,7 FPS auf Hoch, 85,3 FPS auf Niedrig (v0.3: 43,8 FPS auf Hoch; danielblnc v0.6.0 auf derselben Karte: 21,7 FPS).
+- **Bild viel näher an NVIDIA** (+6-8 dB zur Referenz; 4 Netz-Fehler behoben), NVIDIAs Standard-Look, und die **OptiScaler-NR-Regler funktionieren** (Intensity, Style, Tone, Structure, Skin).
+- **Viel weniger Flackern** (`edit_temporal`, -90 %), Netz auf 3 Frames verteilt für gleichmäßigere, höhere FPS.
+- **Looks zur Auswahl** (`presets\`): Standard, Strong, Cinematic, HighQuality_720p, HiRes_1080p, Native_1440p, Performance, Community.
+- **Netz-Auflösungen bis 1080p / 1440p** für mehr Feindetail (kostet FPS).
+- Alle Kernels sind unser eigener Code; keine NVIDIA-Daten im Paket. Alles im Detail: [CHANGELOG.md](CHANGELOG.md).
+
+**Neu in v0.3.1:** nutzt die richtige GPU (nie die iGPU), VRAM-Leck behoben, HDR-Auto-Belichtung, sauberes Abschalten
+bei unbekannter `nvngx_dlssnr.dll`, alle Kernel selbst geschrieben, etwas schneller und weniger VRAM.
+
 **Neu in v0.3:** bis zu 60 FPS ohne Frame Generation auf einer RX 6900 XT, gleichmäßige Frametimes, kein Stottern
 mehr in schnellen Spielen, HDR-Fix (keine weißen Figuren mehr), saubere 2 Durchgänge, sicheres Setup mit Backup und Deinstaller.
 Siehe [CHANGELOG.md](CHANGELOG.md).
@@ -116,6 +128,49 @@ Der erste Start dauert ein paar Sekunden länger. Das ist normal.
 **DirectX-11-Spiele** (z. B. Fallout 4): Oben im Menü unter **Upscalers** einen Upscaler mit
 **w/Dx12** wählen (z. B. `FSR 2.2.1 w/Dx12`) und das Spiel neu starten.
 
+## Look wählen
+
+Im Ordner `presets` liegen vollständige Einstellungsdateien. Zum Wechseln eine davon über `nr_port.ini` im Spielordner kopieren und das Spiel neu starten.
+
+| Preset | Look | FPS auf einer RX 6900 XT (geschätzt) | Wann? |
+|---|---|---|---|
+| **Standard** (Vorgabe) | NVIDIAs Standard-Look, Modell 960x540 | ~43 (Basis) | Zum Anfangen |
+| **Strong** | Deutlich stärkeres Licht und Gesichter, trotzdem sauber | ~43 (kostet nichts extra) | Standard wirkt zu schwach |
+| **Cinematic** | Strong + NVIDIAs Cinematic-Stil: stärkster, gegradeter Look | ~43 (kostet nichts extra) | Screenshots, langsame Spiele |
+| **HighQuality_720p** | Modell 1280x720: Gesichter und Haut viel näher am Ergebnis in voller Auflösung | ~40 | Wenn FPS übrig sind |
+| **HiRes_1080p** | Modell 1920x1080, feinere Details | ~33 | Bildqualität zuerst |
+| **Native_1440p** | Netz in voller 1440p-Auflösung | ~26 | Vergleich, Screenshots |
+| **Performance** | Modell 640x360, weicher | ~45-50 | Schwächere GPUs, schnelle Spiele |
+| **Community** | `compose=nv`, `pass2_gain=1`: für Multipass-Setups von NVIDIA-Nutzern | pro Pass etwa wie Standard; 2 Passes kosten mehr | Wer OptiScalers 2 Passes nutzt |
+
+FPS: Fallout 4 in 1440p, Netz über 3 Frames verteilt; nur Standard ist im Spiel gemessen, die anderen sind aus der Netzzeit
+geschätzt (RX 6900 XT, pro Netzdurchlauf: 7,3 / 10,6 / 16,5 / 32,6 / 56,5 ms bei 360p / 540p / 720p / 1080p / 1440p).
+Alle Presets haben `edit_temporal=0.7` (neu in v0.4.3): entfernt den Großteil des restlichen Flimmerns, ohne FPS zu kosten.
+
+**Tipp:** Den realistischsten Look gibt Style **Cinematic** zusammen mit einer höheren Modellauflösung: `Cinematic.ini`
+kopieren und `model_res=1280x720` setzen (oder `1920x1080`, wenn die FPS reichen).
+
+Die OptiScaler-NR-Regler (Intensity, Style, Local Tone, Local Structure, Skin) ändern das Bild jetzt live. Ein Schlüssel in `nr_port.ini` (z. B. `local_tone=0.5`) überschreibt den Regler.
+
+## Welche nvngx_dlssnr.dll?
+
+Funktioniert mit nvngx_dlssnr.dll 310.8 (altes Modell) und 310.9.16 (neues, ca. 2x leichteres Modell, automatisch gewählt; model=large erzwingt das alte). Mit einem anderen Modell schaltet sich NR selbst ab — bitte auf ein Port-Update warten.
+
+Das Spiel läuft dann mit dem normalen Bild weiter. In `dlssnr_nr.log` steht dann "has a different model than this port supports (310.8 / 310.9.16)".
+
+## Best image: NR + FSR 4 on RX 6000
+
+Das beste Bild gibt es mit NR plus FSR 4 als Upscaler. FSR 4 läuft offiziell nicht auf RX 6000, aber
+[fsr4-shader-performance-overrides](https://github.com/zgauthier2000/fsr4-shader-performance-overrides) macht es dort
+lauffähig. Von dort holen und der Anleitung dort folgen; es ist nicht in diesem ZIP enthalten.
+
+## Bekannte Probleme (v0.4)
+
+- **Höhere Netz-Auflösungen (1080p / 1440p) können in manchen Spielen Artefakte, Ghosting und seltsames Licht zeigen**, und der sichtbare Gewinn gegenüber 540p ist kleiner als erwartet. Wird untersucht; empfohlen ist 960x540 (Standard).
+- Starke Einstellungen (Intensity 2, Tone 2, Cinematic) machen den Effekt deutlich stärker, aber auch das Flackern.
+- Bei schnellen Bewegungen kann mit `nr_split=3/4` Ghosting auftreten; zum Vergleich `nr_split=0` und `edit_temporal=0` in der `nr_port.ini` setzen.
+- Ein paar seltene Absturz-/Sonderfälle aus einem internen Code-Review (Feature wird während der Nutzung freigegeben, unterschiedliche Bildformate, >500-ms-Hänger bei verteilten Frames) werden im nächsten Update behoben.
+
 ## Geht nicht. Was jetzt?
 
 Öffne **`dlssnr_nr.log`** im Spielordner mit dem Editor und schau dir die letzten Zeilen an:
@@ -148,6 +203,8 @@ in leichteren Szenen bis zu 60 FPS, ohne Frame Generation** (Fallout 4, 1440p), 
 | Das KI-Modell (DLSS Neural Rendering) | **NVIDIA**. Steckt in `nvngx_dlssnr.dll`, die du selbst besorgst. |
 | Das Modell auf AMD RX 6000 zum Laufen bringen | **Dieses Projekt** (`nr_runtime.dll`, `nvngx.dll_dlssnr.dll`, `nr_data`) |
 | Einbau ins Spiel (Menü, Einstellungen) | [**janblades OptiScaler-DLSSNR**](https://github.com/janblade/OptiScaler-DLSSNR-PreSR-Multipass) und das [OptiScaler](https://github.com/optiscaler/OptiScaler)-Team, siehe `docs/CREDITS.md` im Release |
+
+Started in danielblnc's Discord; early versions were based on his gfx1100 kernels — all kernels are now our own.
 
 Dieses Projekt enthält keine NVIDIA-Dateien oder -Gewichte. DLSS und NVIDIA sind Marken der NVIDIA
 Corporation. Dieses Projekt hat nichts mit NVIDIA oder AMD zu tun und wird nicht von ihnen unterstützt.

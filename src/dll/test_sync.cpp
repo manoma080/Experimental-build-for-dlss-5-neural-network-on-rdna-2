@@ -19,6 +19,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <numeric>
 #include <atomic>
 #include <thread>
 #include <d3dcompiler.h>
@@ -97,20 +98,49 @@ int main(int argc, char** argv) {
     auto rcreate = (P_create)GetProcAddress(rt, "nr_create"); auto rrun = (P_run)GetProcAddress(rt, "nr_run");
     if (!create || !eval || !release || !state || !rcreate || !rrun) { puts("missing exports"); return 1; }
 
-    al->Reset(); cl->Reset(al, nullptr); void* f = create(L"nvngx_dlssnr.dll", L"data", dev, cl, nullptr, W, H, 0, 1.f, 0, 1.f, 1.f, 1.f, 0, 1); cl->Close();
+    al->Reset(); cl->Reset(al, nullptr); void* f = create(L"nvngx_dlssnr.dll", L"data", dev, cl, nullptr, W, H, 0, 1.f, 0, 1.f, 1.f, -1.f, 1, 1); cl->Close();
     { ID3D12CommandList* l[] = {cl}; q->ExecuteCommandLists(1, l); } if (!wait(5000)) { puts("FAIL timeout"); return 2; }
     if (!f) { printf("FAIL create: %s\n", err()); return 3; }
-    char e2[512] = ""; void* ref = rcreate(dd, (int)MW, (int)MH, 1, e2, sizeof e2); if (!ref) { printf("FAIL reference nr_create: %s\n", e2); return 3; }
+    if (auto pdir = (const char* (*)(void*))GetProcAddress(m, "dlssnr_port_dir")) if (*pdir(f)) { snprintf(dd, sizeof dd, "%s", pdir(f)); printf("data dir (picked by the DLL): %s\n", dd); }   // model folder + step
+    if (getenv("NR_TEST_GUARD")) { double t = now(); while (state(f) == 0 && now() - t < 90000) Sleep(50); }   // also catch a runtime-side refusal (weights.map)
+    const bool guard = state(f) == 4;   // model guard: unknown nvngx_dlssnr.dll, NR off -> pass-through test below
+    if (guard) printf("NR off at create: %s\n", err());
+    char e2[512] = ""; void* ref = guard ? nullptr : rcreate(dd, (int)MW, (int)MH, 1, e2, sizeof e2); if (!ref && !guard) { printf("FAIL reference nr_create: %s\n", e2); return 3; }
+    if (getenv("NR_TEST_RECREATE")) {   // VRAM leak test: N cycles of create -> load -> evaluate -> release, alternating frame sizes. Every 3rd cycle releases
+        // while the runtime is still loading, every 3rd abandons the feature without release (MSFS 2024 host) -> the next create must evict it.
+        // Free VRAM (hipMemGetInfo) is sampled once each fully loaded cycle has its feature live; PASS = spread <= 100 MB (+-50) after warm-up.
+        typedef int (*P_mem)(size_t*, size_t*); HMODULE hip = GetModuleHandleA("amdhip64_6.dll"); auto mem = hip ? (P_mem)GetProcAddress(hip, "hipMemGetInfo") : nullptr;
+        if (!mem) { puts("FAIL no hipMemGetInfo"); return 1; }
+        release(f); const int N = atoi(getenv("NR_TEST_RECREATE")); std::vector<void*> abandoned; size_t lo = SIZE_MAX, hi = 0;
+        for (int i = 0; i < N; i++) {
+            const UINT fw = i % 2 ? W * 3 / 4 : W, fh = i % 2 ? H * 3 / 4 : H; const int kind = i % 3;   // 0 normal, 1 abandon, 2 release while loading
+            if (i && (i - 1) % 3 == 1) Sleep(2100);   // the abandoned one must be idle >= evict_idle_ms (2000) when the next create loads
+            al->Reset(); cl->Reset(al, nullptr); void* g = create(L"nvngx_dlssnr.dll", L"data", dev, cl, nullptr, fw, fh, 0, 1.f, 0, 1.f, 1.f, 1.f, 0, 1); cl->Close();
+            { ID3D12CommandList* l[] = {cl}; q->ExecuteCommandLists(1, l); } if (!wait(5000) || !g) { printf("FAIL recreate %d: %s\n", i, err()); return 3; }
+            if (kind == 2) { release(g); printf("cycle %2d %ux%u released while loading\n", i, fw, fh); continue; }
+            const double t1 = now(); while (state(g) == 0 && now() - t1 < 30000) Sleep(20);
+            if (state(g) != 5) { printf("FAIL recreate %d: state %d (%s)\n", i, state(g), err()); return 4; }
+            for (int k = 0; k < 3; k++) { al->Reset(); cl->Reset(al, nullptr); eval(cl, g, nullptr, color, nullptr, nullptr, out, fw, fh, 0, 0, 0, 0, 0, 0, 0, 0, 0, k == 0, 1.f, 0, 1.f, 1.f, 1.f, 0, 1.f, 1.f); cl->Close();
+                ID3D12CommandList* l[] = {cl}; q->ExecuteCommandLists(1, l); if (!wait(5000)) { puts("FAIL recreate: GPU timeout"); return 2; } }
+            size_t fr = 0, tot = 0; mem(&fr, &tot); if (i >= 3) { lo = std::min(lo, fr); hi = std::max(hi, fr); }
+            printf("cycle %2d %ux%u loaded in %.0f ms, free VRAM %zu MB%s\n", i, fw, fh, now() - t1, fr >> 20, kind == 1 ? " (abandoned, no release)" : "");
+            if (kind == 1) abandoned.push_back(g); else release(g);
+        }
+        for (void* g : abandoned) release(g);
+        Sleep(3000); size_t fr = 0, tot = 0; mem(&fr, &tot); printf("after all releases: free VRAM %zu MB\n", fr >> 20);
+        const size_t spread = hi > lo ? (hi - lo) >> 20 : 0; printf("%s recreate: %d cycles, free VRAM spread %zu MB over the loaded cycles\n", spread <= 100 ? "PASS" : "FAIL", N, spread);
+        return spread <= 100 ? 0 : 9;
+    }
     // NR_TEST_PASSES=2 (flicker mode): OptiScaler "2 passes" -- a second feature, evaluated in the same list on pass 1's output (janblade DlssNr_Dx12.cpp)
     const bool two = getenv("NR_TEST_PASSES") && atoi(getenv("NR_TEST_PASSES")) > 1; void* f2 = nullptr; ID3D12Resource* out2 = nullptr;
-    if (two) { al->Reset(); cl->Reset(al, nullptr); f2 = create(L"nvngx_dlssnr.dll", L"data", dev, cl, nullptr, W, H, 0, 1.f, 0, 1.f, 1.f, 1.f, 0, 1); cl->Close();
+    if (two) { al->Reset(); cl->Reset(al, nullptr); f2 = create(L"nvngx_dlssnr.dll", L"data", dev, cl, nullptr, W, H, 0, 1.f, 0, 1.f, 1.f, -1.f, 1, 1); cl->Close();
         { ID3D12CommandList* l[] = {cl}; q->ExecuteCommandLists(1, l); } if (!wait(5000) || !f2) { printf("FAIL create pass 2: %s\n", err()); return 3; }
         out2 = tex(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, OFMT); }
     double t0 = now(); while ((state(f) == 0 || (f2 && state(f2) == 0)) && now() - t0 < 90000) Sleep(50);
-    printf("dll state %d after %.0f ms (5 = sync)\n", state(f), now() - t0); if (state(f) != 5) { printf("FAIL sync path not active: %s\n", err()); return 4; }
+    printf("dll state %d after %.0f ms (5 = sync)\n", state(f), now() - t0); if (state(f) != 5 && !guard) { printf("FAIL sync path not active: %s\n", err()); return 4; }
     printf("device after create: 0x%08lx\n", (unsigned long)dev->GetDeviceRemovedReason());
 
-    std::vector<uint16_t> in((size_t)MW * MH * 4), refo((size_t)MW * MH * 4);
+    std::vector<uint16_t> in((size_t)MW * MH * 4), refo((size_t)MW * MH * 4), raw((size_t)MW * MH * 4);   // raw: the frame before the DLL's [0,1] input clamp
     const int DX = getenv("NR_TEST_DX") ? atoi(getenv("NR_TEST_DX")) : getenv("NR_TEST_SHIFT") ? atoi(getenv("NR_TEST_SHIFT")) : 13, DY = getenv("NR_TEST_DY") ? atoi(getenv("NR_TEST_DY")) : 0; const bool OBJ = getenv("NR_TEST_OBJ") != nullptr;
     const UINT gpitch = (W * 4 + 255) & ~255u; std::vector<uint8_t> mvScratch((size_t)gpitch * H), dScratch((size_t)gpitch * H); uint8_t *mvp = mvScratch.data(), *dpp = dScratch.data();   // this frame's motion (RG16F) / depth (R32F) upload rows
     const UINT ow = MW / 3, oh = MH / 3, oy = MH / 3; auto objX = [&](int k) { return (UINT)(((long long)k * DX % (MW - ow) + (MW - ow)) % (MW - ow)); };
@@ -129,8 +159,11 @@ int main(int argc, char** argv) {
             else if (NOISE > 0) { uint16_t t[4]; for (int c = 0; c < 4; c++) { uint32_t hsh = (uint32_t)(k * 73856093) ^ (x * 19349663u) ^ (y * 83492791u) ^ (c * 2654435761u); hsh ^= hsh >> 13; hsh *= 0x5bd1e995u; hsh ^= hsh >> 15;
                     t[c] = c == 3 ? s[c] : f2h(std::max(0.0, h2f(s[c]) * (1.0 + NOISE * ((hsh & 0xFFFF) / 32767.5 - 1.0)))); }   // NR_TEST_NOISE: relative per-frame noise
                   memcpy(d, t, 8); memcpy(upp + (size_t)y * pitch + x * 8, t, 8); }
-            else { memcpy(d, s, 8); memcpy(upp + (size_t)y * pitch + x * 8, s, 8); } } };
+            else { memcpy(d, s, 8); memcpy(upp + (size_t)y * pitch + x * 8, s, 8); }
+            memcpy(&raw[d - in.data()], d, 8); for (int c = 0; c < 3; c++) d[c] = (d[c] & 0x8000) || (d[c] & 0x7C00) == 0x7C00 && (d[c] & 0x3FF) ? 0 : d[c] > 0x3C00 ? 0x3C00 : d[c]; } };   // the DLL (ldr_input=1, LDR) clamps the network input to [0,1]; NaN -> 0
     ID3D12Resource *fmv = nullptr, *fdp = nullptr, *fmu = nullptr, *fdu = nullptr; bool ffirst = true;   // flicker mode: motion/depth textures, their upload buffers (mvp/dpp)
+    ID3D12QueryHeap* tsq = nullptr; ID3D12Resource* tsb = nullptr; uint64_t* tsp = nullptr; UINT64 tsf = 1; std::vector<double> tsv;   // NR_TEST_TS: GPU time of the evaluate call per frame (timestamps around it)
+    if (getenv("NR_TEST_TS")) { D3D12_QUERY_HEAP_DESC qd = {D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2, 0}; CK(dev->CreateQueryHeap(&qd, IID_PPV_ARGS(&tsq))); tsb = buf(D3D12_HEAP_TYPE_READBACK, 256, D3D12_RESOURCE_STATE_COPY_DEST); tsb->Map(0, nullptr, (void**)&tsp); q->GetTimestampFrequency(&tsf); }   // flicker mode: motion/depth textures, their upload buffers (mvp/dpp)
     auto frame = [&](int k, bool exec, double* ms) -> int {   // one game frame; returns evaluate's result, -100 on GPU timeout
         al->Reset(); cl->Reset(al, nullptr);
         if (fmv) { for (int g = 0; g < 2; g++) { ID3D12Resource* t = g ? fdp : fmv; DXGI_FORMAT fm = g ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R16G16_FLOAT;
@@ -139,28 +172,39 @@ int main(int argc, char** argv) {
             auto d0 = ts(t); cl->CopyTextureRegion(&d0, 0, 0, 0, &s0, nullptr); bar(t, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE); } ffirst = false; }
         bar(color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST); { auto d = ts(color), s = fp(up, pitch, FMT); cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr); }
         bar(color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        int r = k < 0 ? 1 : eval(cl, f, nullptr, color, fdp, fmv, out, W, H, W, H, W, H, 0, 0, 0, 0, fmv ? 1 : 0, k == 0, 1.f, 0, 1.f, 1.f, 1.f, 0, fmv ? (float)W : 1.f, fmv ? (float)H : 1.f);
+        if (tsq) cl->EndQuery(tsq, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+        int r = k < 0 ? 1 : eval(cl, f, nullptr, color, fdp, fmv, out, W, H, W, H, W, H, 0, 0, 0, 0, fmv ? 1 : 0, k == 0, 1.f, 0, 1.f, 1.f, -1.f, 1, fmv ? (float)W : 1.f, fmv ? (float)H : 1.f);
+        if (tsq) { cl->EndQuery(tsq, D3D12_QUERY_TYPE_TIMESTAMP, 1); cl->ResolveQueryData(tsq, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, tsb, 0); }
         ID3D12Resource* fin_ = out;
         if (f2 && k >= 0) { bar(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);   // pass 2: pass 1's output is the input
-            int r2 = eval(cl, f2, nullptr, out, fdp, fmv, out2, W, H, W, H, W, H, 0, 0, 0, 0, fmv ? 1 : 0, k == 0, 1.f, 0, 1.f, 1.f, 1.f, 0, fmv ? (float)W : 1.f, fmv ? (float)H : 1.f);
+            int r2 = eval(cl, f2, nullptr, out, fdp, fmv, out2, W, H, W, H, W, H, 0, 0, 0, 0, fmv ? 1 : 0, k == 0, 1.f, 0, 1.f, 1.f, -1.f, 1, fmv ? (float)W : 1.f, fmv ? (float)H : 1.f);
             bar(out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); if (r2 != 1) r = r2; fin_ = out2; }
         bar(fin_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE); { auto d = fp(rb, opitch, OFMT), s = ts(fin_); cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr); }
         bar(fin_, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); cl->Close();
         if (!exec) return r;                                  // the host dropped this list
-        double a = now(); ID3D12CommandList* l[] = {cl}; q->ExecuteCommandLists(1, l); if (!wait(5000)) return -100; *ms = now() - a; return r; };
+        double a = now(); ID3D12CommandList* l[] = {cl}; q->ExecuteCommandLists(1, l); if (!wait(5000)) return -100; *ms = now() - a; if (tsq && k >= 8) tsv.push_back((tsp[1] - tsp[0]) * 1000.0 / tsf); return r; };
     double se_o = 0, se_i = 0; auto psnr = [&](double se) { return 10 * log10(3.0 * MW * MH / std::max(se, 1e-12)); };
+    UINT bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;   // bounding box of the values beyond tolerance (printed on MISMATCH)
     auto compare = [&](size_t* beyond, double* maxerr) {
-        *beyond = 0; *maxerr = 0; se_o = se_i = 0;
+        *beyond = 0; *maxerr = 0; se_o = se_i = 0; bx0 = by0 = ~0u; bx1 = by1 = 0;
         for (UINT y = 0; y < MH; y++) for (UINT x = 0; x < MW; x++) {
             double ov[3] = {0, 0, 0};   // UP > 1: mean of the UPxUP frame block (bilinear up + box down ~ identity)
             for (UINT j = 0; j < UP * UP; j++) { size_t fy = y * UP + j / UP, fx = x * UP + j % UP; uint16_t o[4];
                 if (r11) unpack_r11g11b10(*(uint32_t*)(rbp + fy * pitch + fx * 4), o); else memcpy(o, rbp + fy * opitch + fx * 8, 8);
                 for (int c = 0; c < 3; c++) ov[c] += h2f(o[c]) / (UP * UP); }
             for (int c = 0; c < 3; c++) {
-                uint16_t b = refo[((size_t)y * MW + x) * 4 + c]; double bv = (b & 0x7C00) == 0x7C00 ? 0 : std::max(0.0, h2f(b));
+                const size_t m = ((size_t)y * MW + x) * 4 + c; uint16_t b = refo[m];   // expected: frame + (NR - clamped input), so values above 1 keep their excess
+                double bv = std::max(0.0, ((b & 0x7C00) == 0x7C00 ? 0 : (double)h2f(b)) + ((raw[m] & 0x7C00) == 0x7C00 ? 0 : (double)h2f(raw[m])) - h2f(in[m]));
                 double e = fabs(ov[c] - bv);
-                { double iv = h2f(in[((size_t)y * MW + x) * 4 + c]); se_o += std::min(e * e, 1.0); se_i += std::min((iv - bv) * (iv - bv), 1.0); }   // UP > 1 metric: PSNR (peak 1, clamped) of NR result vs reference, against doing nothing
-                if (e > *maxerr) *maxerr = e; if (e > 0.004 + (r11 ? 0.035 : 0.004) * fabs(bv)) (*beyond)++; } } };   // r11: 5-6 bit mantissa
+                { double iv = h2f(raw[m]); se_o += std::min(e * e, 1.0); se_i += std::min((iv - bv) * (iv - bv), 1.0); }   // UP > 1 metric: PSNR (peak 1, clamped) of NR result vs reference, against doing nothing
+                if (e > *maxerr) *maxerr = e; if (e > 0.004 + (r11 ? 0.035 : 0.004) * fabs(bv)) { (*beyond)++; bx0 = std::min(bx0, x); by0 = std::min(by0, y); bx1 = std::max(bx1, x); by1 = std::max(by1, y); } } } };   // r11: 5-6 bit mantissa
+    if (guard) {   // every frame must come back as the native input, evaluate returning 1
+        int bad = 0; double ms = 0;
+        for (int k = 0; k < 5; k++) { makeFrame(k); int r = frame(k, true, &ms); if (r == -100) { puts("FAIL GPU wait timed out"); return 7; }
+            size_t diff = 0; for (UINT y = 0; y < H; y++) diff += memcmp(rbp + (size_t)y * opitch, upp + (size_t)y * pitch, (size_t)W * BPP) != 0;
+            printf("frame %d: evaluate %d, %zu rows differ from the input\n", k, r, diff); bad += r != 1 || diff; }
+        release(f); printf("device 0x%08lx\n", (unsigned long)dev->GetDeviceRemovedReason());
+        puts(bad || dev->GetDeviceRemovedReason() != S_OK ? "FAIL passthrough" : "PASSTHROUGH PASS (NR off, native frames)"); return bad ? 9 : 0; }
 
     if (getenv("NR_TEST_PACE")) {   // pacing: a game submitting every NR_TEST_CPU_MS with up to 2 frames queued; frame time = gap between GPU completions
         const int n = atoi(getenv("NR_TEST_PACE")); const int QD = getenv("NR_TEST_QUEUE") ? std::max(1, std::min(7, atoi(getenv("NR_TEST_QUEUE")))) : 2, NQ = QD + 1; const double cpu = getenv("NR_TEST_CPU_MS") ? atof(getenv("NR_TEST_CPU_MS")) : 8.0;
@@ -213,7 +257,7 @@ int main(int argc, char** argv) {
             if (lps) { cl->SetComputeRootSignature(lrs); cl->SetPipelineState(lps); cl->SetComputeRoot32BitConstants(0, 1, &lit, 0); cl->SetComputeRootUnorderedAccessView(1, lb->GetGPUVirtualAddress()); cl->Dispatch(4096, 1, 1);
                        D3D12_RESOURCE_BARRIER ub = {}; ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; cl->ResourceBarrier(1, &ub); }
             unsigned x1, x2, ru0, ru1; stats(f, &x1, &x2, &ru0);
-            eval(cl, f, nullptr, color, dpt, mvt, out, W, H, W, H, W, H, 0, 0, 0, 0, 1, k == 0, 1.f, 0, 1.f, 1.f, 1.f, 0, (float)W, (float)H);
+            eval(cl, f, nullptr, color, dpt, mvt, out, W, H, W, H, W, H, 0, 0, 0, 0, 1, k == 0, 1.f, 0, 1.f, 1.f, -1.f, 1, (float)W, (float)H);
             stats(f, &x1, &x2, &ru1); greu[k] = ru1 != ru0;
             if (ghost) { bar(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE); { auto d = fp(gr[k % NQ], opitch, OFMT), s = ts(out); cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr); }
                          bar(out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); }
@@ -230,6 +274,11 @@ int main(int argc, char** argv) {
                     const UINT px = (UINT)(i / 4 % W), py = (UINT)(i / 4 / W); if (inObj(j, px, py) || inObj(j - 1, px, py)) { er += eo; erl += ei; cr++; } } }
             printf("ghost: %d reused frames, mean |out - NR(same frame)| %.5f (live frame without NR: %.5f)\n", nf, cnt ? e / cnt : 0, cnt ? el / cnt : 0);
             if (OBJ) printf("ghost object region (object now or one frame ago): %.5f (live %.5f)\n", cr ? er / cr : 0, cr ? erl / cr : 0);
+            if (getenv("NR_TEST_DUMP")) for (int j = n - 1; j >= 0; j--) if (!gout[j].empty()) {   // last reused frame: input, output, NR of the same frame (f32 RGB, W x H)
+                makeFrame(j); float gms; rrun(ref, in.data(), refo.data(), &gms); const uint16_t* src[3] = { in.data(), gout[j].data(), refo.data() }; const char* nm[3] = { "_in.bin", "_out.bin", "_ref.bin" };
+                for (int q = 0; q < 3; q++) { FILE* df = fopen((std::string(getenv("NR_TEST_DUMP")) + nm[q]).c_str(), "wb"); if (!df) continue;
+                    for (size_t i = 0; i < (size_t)W * H; i++) for (int c = 0; c < 3; c++) { float v = h2f(src[q][i * 4 + c]); v = v == v ? v : 0.f; fwrite(&v, 4, 1, df); } fclose(df); }
+                printf("ghost dump: frame %d\n", j); break; }
         }
         std::vector<double> d; for (size_t i = 10; i < done.size(); i++) d.push_back(done[i] - done[i - 1]);   // skip warm-up
         double s = 0, s2 = 0, oe[2] = {}; for (size_t i = 0; i < d.size(); i++) { s += d[i]; s2 += d[i] * d[i]; oe[(i + 11) & 1] += d[i]; } double av = s / d.size(), sd = sqrt(std::max(0.0, s2 / d.size() - av * av));
@@ -256,7 +305,7 @@ int main(int argc, char** argv) {
                 bar(t, gfirst ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
                 D3D12_TEXTURE_COPY_LOCATION s0 = {}; s0.pResource = g ? du : mu; s0.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; s0.PlacedFootprint.Footprint = {fm, W, H, 1, gpitch};
                 auto d0 = ts(t); cl->CopyTextureRegion(&d0, 0, 0, 0, &s0, nullptr); bar(t, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE); } gfirst = false;
-            int r = eval(cl, f, nullptr, color, dpt, mvt, out, W, H, W, H, W, H, 0, 0, 0, 0, 1, k == 0, 1.f, 0, 1.f, 1.f, 1.f, 0, (float)W, (float)H);
+            int r = eval(cl, f, nullptr, color, dpt, mvt, out, W, H, W, H, W, H, 0, 0, 0, 0, 1, k == 0, 1.f, 0, 1.f, 1.f, -1.f, 1, (float)W, (float)H);
             bar(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE); { auto d = fp(rb, opitch, OFMT), s = ts(out); cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr); }
             bar(out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); cl->Close();
             double a = now(); ID3D12CommandList* l[] = {cl}; q->ExecuteCommandLists(1, l); if (!wait(5000)) { printf("FAIL frame %d: GPU wait timed out\n", k); return 7; } tl.push_back(now() - a);
@@ -286,7 +335,8 @@ int main(int argc, char** argv) {
         // pixels whose luma rises above 1.5 x input + 0.05 (linear), and in display space P = sRGB(x/(1+x)): share with P(out) - P(in) > 0.1.
         // NR_TEST_HDRDUMP=prefix: writes prefix_in.ppm / prefix_out.ppm (P-tonemapped, 8 bit) for viewing.
         const int n = atoi(getenv("NR_TEST_HDR")), passes = getenv("NR_TEST_PASSES") ? atoi(getenv("NR_TEST_PASSES")) : 1; const float ex = getenv("NR_TEST_EXP") ? (float)atof(getenv("NR_TEST_EXP")) : 3.f;
-        auto P = [](double x) { x = std::max(x, 0.0); x = x / (1 + x); return x <= 0.0031308 ? 12.92 * x : 1.055 * pow(x, 1 / 2.4) - 0.055; };
+        const double ws = getenv("NR_TEST_WHITE") ? atof(getenv("NR_TEST_WHITE")) / ex : 1.0;   // NR_TEST_WHITE=w: the whole scene x w/ex (scene white at w); P and the dumps are normalised back by 1/ws, so an exposure-invariant DLL gives the same numbers at every w
+        auto P = [ws](double x) { x = std::max(x / ws, 0.0); x = x / (1 + x); return x <= 0.0031308 ? 12.92 * x : 1.055 * pow(x, 1 / 2.4) - 0.055; };
         auto lin = [](double v) { v = std::min(std::max(v, 0.0), 1.0); return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4); };
         std::vector<float> hin((size_t)W * H * 3); std::vector<char> skin((size_t)W * H);
         const float sk[4][3] = {{0.30f, 0.30f, 0.12f}, {0.62f, 0.45f, 0.10f}, {0.45f, 0.70f, 0.14f}, {0.80f, 0.75f, 0.09f}};   // centre u, v, radius (fraction of H)
@@ -294,19 +344,35 @@ int main(int argc, char** argv) {
             for (int c = 0; c < 3; c++) { hin[i * 3 + c] = ex * (float)lin(h2f(base[((size_t)sy * SW + sx) * 4 + c])); l += hin[i * 3 + c] / 3; }
             if (y < H / 8) { const float v = 5.f + 45.f * x / W; for (int c = 0; c < 3; c++) hin[i * 3 + c] = v * (c == 2 ? 0.8f : 1.f) * (0.8f + 0.4f * l / ex); }
             for (auto& s : sk) { const float du = (x + .5f) / H - s[0] * W / H, dv = (y + .5f) / H - s[1]; if (du * du + dv * dv < s[2] * s[2]) { const float k = 1.5f + 2.5f * (1 - sqrtf(du * du + dv * dv) / s[2]) * (0.7f + 0.6f * std::min(l / ex, 1.f));
-                hin[i * 3] = 1.0f * k; hin[i * 3 + 1] = 0.66f * k; hin[i * 3 + 2] = 0.5f * k; skin[i] = 1; } } }
+                hin[i * 3] = 1.0f * k; hin[i * 3 + 1] = 0.66f * k; hin[i * 3 + 2] = 0.5f * k; skin[i] = 1; } }  for (int c = 0; c < 3; c++) hin[i * 3 + c] *= (float)ws; }
         for (UINT y = 0; y < H; y++) for (UINT x = 0; x < W; x++) { uint16_t h4[4]; float* p = &hin[((size_t)y * W + x) * 3]; for (int c = 0; c < 3; c++) h4[c] = f2h(p[c]); h4[3] = f2h(1.f);
             if (e5) { uint32_t v = pk5(h4); memcpy(upp + (size_t)y * pitch + x * 4, &v, 4); up5(v, h4); } else if (r11) { uint32_t v; pack_r11g11b10(h4, &v); memcpy(upp + (size_t)y * pitch + x * 4, &v, 4); unpack_r11g11b10(v, h4); }
             else memcpy(upp + (size_t)y * pitch + x * 8, h4, 8);
             for (int c = 0; c < 3; c++) p[c] = (float)h2f(h4[c]); }   // what the DLL really gets
+        // passes 2: the second pass is a second feature (f2), as janblade's passFeature[pass]; NR_TEST_P2CLAMP=1 feeds it through the host's ClampProxy (CPU copy of it)
+        if (passes > 1 && !f2) { puts("FAIL passes 2 needs NR_TEST_PASSES=2 at create"); return 3; }
+        const bool clampP2 = getenv("NR_TEST_P2CLAMP") && atoi(getenv("NR_TEST_P2CLAMP"));
         ID3D12Resource* out2 = passes > 1 ? tex(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, OFMT) : nullptr;
+        ID3D12Resource *p2in = clampP2 ? tex(D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, OFMT) : nullptr, *p2up = clampP2 ? buf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)opitch * H, D3D12_RESOURCE_STATE_GENERIC_READ) : nullptr;
+        uint8_t* p2u = nullptr; if (p2up) p2up->Map(0, nullptr, (void**)&p2u);
         for (int k = 0; k < n; k++) {
             al->Reset(); cl->Reset(al, nullptr);
             bar(color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST); { auto d = ts(color), s = fp(up, pitch, FMT); cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr); }
             bar(color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            int r = eval(cl, f, nullptr, color, nullptr, nullptr, out, W, H, W, H, W, H, 0, 0, 0, 0, 0, k == 0, 1.f, 0, 1.f, 1.f, 1.f, 0, 1.f, 1.f); ID3D12Resource* last = out;
-            if (passes > 1) { bar(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                r &= eval(cl, f, nullptr, out, nullptr, nullptr, out2, W, H, W, H, W, H, 0, 0, 0, 0, 0, 0, 1.f, 0, 1.f, 1.f, 1.f, 0, 1.f, 1.f);
+            int r = eval(cl, f, nullptr, color, nullptr, nullptr, out, W, H, W, H, W, H, 0, 0, 0, 0, 0, k == 0, 1.f, 0, 1.f, 1.f, -1.f, 1, 1.f, 1.f); ID3D12Resource* last = out;
+            if (passes > 1 && clampP2) {   // host ClampProxy (janblade dlssnr.hlsl mode 12, PassFeedback 1): next = saturate(P + saturate(alpha) * (raw - P)), alpha fits raw - P into the unit cube, P = pass 1 input
+                bar(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE); { auto d = fp(rb, opitch, OFMT), s = ts(out); cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr); }
+                bar(out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); cl->Close();
+                { ID3D12CommandList* l[] = {cl}; q->ExecuteCommandLists(1, l); } if (!wait(5000)) { printf("FAIL frame %d: GPU wait timed out\n", k); return 7; }
+                for (UINT y = 0; y < H; y++) for (UINT x = 0; x < W; x++) { uint16_t o[4]; memcpy(o, rbp + (size_t)y * opitch + x * 8, 8); const float* pp = &hin[((size_t)y * W + x) * 3]; float d[3], a = 1.f;
+                    for (int c = 0; c < 3; c++) { float v = h2f(o[c]); d[c] = (v == v && fabsf(v) < 1e30f ? v : 0.5f) - pp[c]; if (d[c] > 1e-6f) a = std::min(a, (1.f - pp[c]) / d[c]); else if (d[c] < -1e-6f) a = std::min(a, -pp[c] / d[c]); }
+                    a = std::min(std::max(a, 0.f), 1.f); for (int c = 0; c < 3; c++) o[c] = f2h(std::min(std::max(pp[c] + a * d[c], 0.f), 1.f)); memcpy(p2u + (size_t)y * opitch + x * 8, o, 8); }
+                al->Reset(); cl->Reset(al, nullptr);
+                bar(p2in, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST); { auto d = ts(p2in), s = fp(p2up, opitch, OFMT); cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr); }
+                bar(p2in, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                r &= eval(cl, f2, nullptr, p2in, nullptr, nullptr, out2, W, H, W, H, W, H, 0, 0, 0, 0, 0, k == 0, 1.f, 0, 1.f, 1.f, -1.f, 1, 1.f, 1.f); last = out2; }
+            else if (passes > 1) { bar(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);   // raw: pass 1's output (RGBA16F) straight into the second feature
+                r &= eval(cl, f2, nullptr, out, nullptr, nullptr, out2, W, H, W, H, W, H, 0, 0, 0, 0, 0, k == 0, 1.f, 0, 1.f, 1.f, -1.f, 1, 1.f, 1.f);
                 bar(out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); last = out2; }
             bar(last, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE); { auto d = fp(rb, opitch, OFMT), s = ts(last); cl->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr); }
             bar(last, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS); cl->Close();
@@ -315,7 +381,7 @@ int main(int argc, char** argv) {
             size_t wo = 0, wp = 0, sw = 0, ns = 0; double dp = 0, mx = 0, so = 0, si = 0;
             for (size_t i = 0; i < (size_t)W * H; i++) { const size_t y = i / W, x = i % W; uint16_t o[4]; if (r11) unpack_r11g11b10(*(uint32_t*)(rbp + y * pitch + x * 4), o); else memcpy(o, rbp + y * opitch + x * 8, 8);
                 double lo = 0, li = 0; for (int c = 0; c < 3; c++) { const double wl = c == 0 ? .2126 : c == 1 ? .7152 : .0722, v = h2f(o[c]); lo += wl * (v == v ? v : 1e9); li += wl * hin[i * 3 + c]; }
-                const bool w1 = lo > 1.5 * li + 0.05, w2 = P(lo) - P(li) > 0.1; wo += w1; wp += w2; dp += fabs(P(lo) - P(li)); mx = std::max(mx, lo);
+                const bool w1 = lo > 1.5 * li + 0.05 * ws, w2 = P(lo) - P(li) > 0.1; wo += w1; wp += w2; dp += fabs(P(lo) - P(li)); mx = std::max(mx, lo);
                 if (skin[i]) { ns++; sw += w2; so += lo; si += li; } }
             const double N = (double)W * H;
             if (k < 2 || k == n - 1) printf("HDR frame %d (passes %d): white-out (lin) %.3f%%, white-out (display) %.3f%%, mean |dP| %.5f, max luma %.1f | skin: white-out %.3f%%, mean luma out/in %.3f\n",
@@ -370,7 +436,7 @@ int main(int argc, char** argv) {
         fmu = buf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)gpitch * H, D3D12_RESOURCE_STATE_GENERIC_READ); fdu = buf(D3D12_HEAP_TYPE_UPLOAD, (UINT64)gpitch * H, D3D12_RESOURCE_STATE_GENERIC_READ);
         if (!fmv || !fdp || !fmu || !fdu) { puts("FAIL guide resources"); return 1; } fmu->Map(0, nullptr, (void**)&mvp); fdu->Map(0, nullptr, (void**)&dpp);
         std::vector<float> fin((size_t)W * H * 3), fout(fin.size()), pin(fin.size()), pout(fin.size()), mi((size_t)MW * MH * 3), mo(mi.size()), pmi(mi.size()), pmo(mi.size());
-        double hfo = 0, hfi = 0; int nhf = 0; Fr tot, rtot; int nf = 0; double pulse[2] = {}; int npulse[2] = {}; uint64_t hsh = 1469598103934665603ull;
+        double hfo = 0, hfi = 0; int nhf = 0; Fr tot, rtot, sst; int nf = 0, nss = 0; double pulse[2] = {}; int npulse[2] = {}; double eabs = 0; int neabs = 0; uint64_t hsh = 1469598103934665603ull;
         for (int k = 0; k < frames; k++) {
             gen(fin, W, H, k); float a[2], b[2]; shift(k, a); shift(k - 1, b); const uint16_t hv[2] = { f2h((a[0] - b[0]) / W), f2h((a[1] - b[1]) / H) }; const float dv = 0.1f;
             for (UINT y = 0; y < H; y++) for (UINT x = 0; x < W; x++) { memcpy(mvp + (size_t)y * gpitch + x * 4, hv, 4); memcpy(dpp + (size_t)y * gpitch + x * 4, &dv, 4);
@@ -381,7 +447,8 @@ int main(int argc, char** argv) {
             int r = frame(k, true, &ms); if (r == -100) { printf("FAIL frame %d: GPU wait timed out\n", k); return 7; } if (r != 1) { printf("FAIL frame %d: evaluate returned %d\n", k, r); return 7; }
             for (UINT y = 0; y < H; y++) for (UINT x = 0; x < W; x++) { uint16_t o[4]; if (r11) unpack_r11g11b10(*(uint32_t*)(rbp + (size_t)y * pitch + x * 4), o); else memcpy(o, rbp + (size_t)y * opitch + x * 8, 8);
                 for (int c = 0; c < 3; c++) { double v = h2f(o[c]); fout[((size_t)y * W + x) * 3 + c] = v == v ? (float)v : 0.f; } }
-            { double e = 0; for (size_t i = 0; i < fin.size(); i += 3) for (int c = 0; c < 3; c++) e += (c == 0 ? .2126 : c == 1 ? .7152 : .0722) * (std::min(std::max(fout[i + c], 0.f), 1.f) - std::min(std::max(fin[i + c], 0.f), 1.f));
+            { double e = 0, ea = 0; for (size_t i = 0; i < fin.size(); i += 3) for (int c = 0; c < 3; c++) { const double d = std::min(std::max(fout[i + c], 0.f), 1.f) - std::min(std::max(fin[i + c], 0.f), 1.f); e += (c == 0 ? .2126 : c == 1 ? .7152 : .0722) * d; ea += fabs(d); }
+              if (k >= 4) { eabs += ea / fin.size(); neabs++; }   // effect strength: mean |out - in| (display, RGB)
               uint64_t fh = 1469598103934665603ull; for (float v : fout) { uint32_t b; memcpy(&b, &v, 4); hsh = (hsh ^ b) * 1099511628211ull; fh = (fh ^ b) * 1099511628211ull; }   // output hash over all frames (bit-exactness between builds)
               if (k >= frames - 4) printf("FHASH %d %016llx\n", k, (unsigned long long)fh);   // per frame (static sequences: split vs non-split once settled)
               if (k > 0) pulse[k & 1] += e / (fin.size() / 3), npulse[k & 1]++; }   // odd/even pulsing: mean luma edit (out - in, display) per frame parity
@@ -394,14 +461,18 @@ int main(int argc, char** argv) {
                     s += fabs(4 * L(x, y) - L(x - 1, y) - L(x + 1, y) - L(x, y - 1) - L(x, y + 1)); } return s / ((double)(W - 16) * (H - 16)); };   // high-frequency energy: mean |Laplacian| of display luma
               if (k >= 4) { hfo += hf(fout); hfi += hf(fin); nhf++; }
               if (k == frames - 1 && getenv("NR_TEST_DUMP")) { for (int q = 0; q < 2; q++) { std::string fn = std::string(getenv("NR_TEST_DUMP")) + (q ? "_out.bin" : "_in.bin"); FILE* df = fopen(fn.c_str(), "wb"); if (df) { fwrite(q ? fout.data() : fin.data(), 4, fin.size(), df); fclose(df); } } } }
-            if (k > 0) { Fr e = measure(fin, fout, pin, pout, W, H, k); tot.o += e.o; tot.i += e.i; tot.j += e.j; tot.v += e.v; tot.n += e.n; nf++; Fr er;
+            if (k > 0) { Fr e = measure(fin, fout, pin, pout, W, H, k); tot.o += e.o; tot.i += e.i; tot.j += e.j; tot.v += e.v; tot.n += e.n; nf++;
+                if (k >= 8) { sst.o += e.o; sst.i += e.i; sst.j += e.j; sst.v += e.v; sst.n += e.n; nss++; } Fr er;   // steady state (k >= 8): without the first edit's fade-in
                 if (doRef) { er = measure(mi, mo, pmi, pmo, MW, MH, k); rtot.o += er.o; rtot.i += er.i; rtot.j += er.j; rtot.v += er.v; rtot.n += er.n; }
-                if (k < 4 || k % 10 == 0) printf("frame %d: inst out %.5f in %.5f, white jumps %zu%s\n", k, e.o, e.i, e.j, doRef ? (std::string(" | network alone: inst out ") + std::to_string(er.o) + " in " + std::to_string(er.i) + ", jumps " + std::to_string(er.j)).c_str() : ""); }
+                if (k < 4 || k % 10 == 0 || getenv("NR_TEST_PERFRAME")) printf("frame %d: inst out %.5f in %.5f, white jumps %zu, visible %.3f%%%s\n", k, e.o, e.i, e.j, 100.0 * e.v / std::max<size_t>(e.n, 1), doRef ? (std::string(" | network alone: inst out ") + std::to_string(er.o) + " in " + std::to_string(er.i) + ", jumps " + std::to_string(er.j)).c_str() : ""); }
             std::swap(fin, pin); std::swap(fout, pout); std::swap(mi, pmi); std::swap(mo, pmo); }
         printf("OUTHASH %016llx\n", (unsigned long long)hsh);
         printf("PULSE mean luma edit odd %+.5f even %+.5f |diff| %.5f\n", pulse[1] / std::max(npulse[1], 1), pulse[0] / std::max(npulse[0], 1), fabs(pulse[1] / std::max(npulse[1], 1) - pulse[0] / std::max(npulse[0], 1)));
+        if (!tsv.empty()) { std::sort(tsv.begin(), tsv.end()); printf("TS evaluate GPU ms (frames >= 8): p10 %.3f median %.3f mean-of-lowest-half %.3f\n", tsv[tsv.size() / 10], tsv[tsv.size() / 2],
+            std::accumulate(tsv.begin(), tsv.begin() + tsv.size() / 2, 0.0) / (tsv.size() / 2)); }
+        printf("EDIT mean |out - in| (display RGB) %.5f over %d frames\n", eabs / std::max(neabs, 1), neabs);
         printf("HF mean |Laplacian| luma: out %.5f in %.5f (x%.3f) over %d frames\n", hfo / std::max(nhf, 1), hfi / std::max(nhf, 1), hfi > 0 ? hfo / hfi : 0, nhf);
-        report("FLICKER frame", tot, nf, W, H); if (doRef) report("FLICKER network-alone", rtot, nf, MW, MH);
+        report("FLICKER frame", tot, nf, W, H); report("FLICKER steady(k>=8)", sst, nss, W, H); if (doRef) report("FLICKER network-alone", rtot, nf, MW, MH);
         if (f2) release(f2); release(f); return 0;
     }
     // baseline: the same list without evaluate
@@ -418,6 +489,7 @@ int main(int argc, char** argv) {
         ts_.push_back(ms); size_t bad; double mx; compare(&bad, &mx);
         bool ok = UP > 1 ? psnr(se_o) >= 30 : bad <= (size_t)MW * MH * 3 / 1000; failed += !ok;   // UP > 1 (resampled): compare quality, not values
         if (k < 3 || k % 50 == 0 || !ok) printf("frame %d: %.1f ms list (ref nr_run %.1f ms) | %zu rgb values beyond tol, max err %.4g %s\n", k, ms, tr.back(), bad, mx, ok ? "ok" : "MISMATCH");
+        if (!ok) printf("  beyond-tol box x %u..%u y %u..%u\n", bx0, bx1, by0, by1);
         static const bool psall = getenv("NR_TEST_PSNR") != nullptr;   // NR_TEST_PSNR=1: PSNR vs the vit_every=1 reference every frame (lossy ini settings)
         if (psall) printf("psnr %d %.2f %.2f\n", k, psnr(se_o), ms);
         if (UP > 1 && (k < 3 || !ok)) printf("  psnr vs reference: NR %.1f dB, no NR %.1f dB\n", psnr(se_o), psnr(se_i));

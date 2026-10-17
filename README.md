@@ -14,6 +14,18 @@ This mod makes it run on **AMD Radeon RX 6000** graphics cards (RDNA2).
 > **Experimental.** It can crash, look wrong, or cost a lot of FPS. Do not use it in online games with
 > anti-cheat.
 
+**New in v0.4:**
+- **NVIDIA's new DLSS 5 model** (nvngx_dlssnr.dll 310.9.16) is used automatically: about **2x lighter**, ~10 ms per network run at 960x540 on an RX 6900 XT (v0.3: 24 ms). The old 310.8 DLL still works with the old model.
+- **Cyberpunk 2077, 1440p, FSR Quality, no frame generation, RX 6900 XT:** 54.7 fps on High, 85.3 fps on Low (v0.3: 43.8 fps on High; danielblnc v0.6.0 on the same card: 21.7 fps).
+- **Image much closer to NVIDIA's** (+6-8 dB vs the reference; 4 network bugs fixed), NVIDIA's default look, and the **OptiScaler NR sliders now work** (intensity, style, tone, structure, skin).
+- **Much less flicker** (`edit_temporal`, flicker -90 %), network split over 3 frames for even, higher fps.
+- **Looks to choose from** (`presets\`): Standard, Strong, Cinematic, HighQuality_720p, HiRes_1080p, Native_1440p, Performance, Community.
+- **Network resolutions up to 1080p / 1440p** for more fine detail (costs fps).
+- All kernels are our own; no NVIDIA data in the package. Full list: [CHANGELOG.md](CHANGELOG.md).
+
+**New in v0.3.1:** uses the right GPU (never the iGPU), VRAM leak fix, HDR auto-exposure, clean NR-off with an unknown
+`nvngx_dlssnr.dll`, all kernels our own, a bit faster and less VRAM.
+
 **New in v0.3:** up to 60 FPS without frame generation on an RX 6900 XT, even frame pacing, no more stutter
 in fast games, HDR fix (no more white characters), clean 2 passes, safe setup with backup and uninstaller.
 See [CHANGELOG.md](CHANGELOG.md).
@@ -115,6 +127,49 @@ The first start takes a few seconds longer. That is normal.
 **DirectX 11 games** (for example Fallout 4): in the menu at the top, under **Upscalers**, pick an
 upscaler that says **w/Dx12** (for example `FSR 2.2.1 w/Dx12`) and restart the game.
 
+## Choosing a look
+
+The folder `presets` has complete settings files. To switch, copy one over `nr_port.ini` in the game folder and restart the game.
+
+| Preset | Look | FPS on an RX 6900 XT (est.) | When to use it |
+|---|---|---|---|
+| **Standard** (default) | NVIDIA's default look, 960x540 model | ~43 (baseline) | Start here |
+| **Strong** | Clearly stronger light and faces, still clean | ~43 (no extra cost) | Standard looks too subtle |
+| **Cinematic** | Strong + NVIDIA's Cinematic style: strongest, graded look | ~43 (no extra cost) | Screenshots, slow games |
+| **HighQuality_720p** | 1280x720 model: faces and skin much closer to the full-resolution result | ~40 | You have fps to spare |
+| **HiRes_1080p** | 1920x1080 model, finer detail | ~33 | Image quality first |
+| **Native_1440p** | Network at full 1440p | ~26 | Comparison, screenshots |
+| **Performance** | 640x360 model, softer | ~45-50 | Weaker GPUs, fast games |
+| **Community** | `compose=nv`, `pass2_gain=1`: for NVIDIA multipass setups copied from NVIDIA users | per pass about as Standard; 2 passes cost more | You use OptiScaler's 2 passes |
+
+FPS: Fallout 4 at 1440p, network split over 3 frames; only Standard is measured in a game, the others are estimated from the
+network time (RX 6900 XT, per network run: 7.3 / 10.6 / 16.5 / 32.6 / 56.5 ms at 360p / 540p / 720p / 1080p / 1440p).
+Every preset has `edit_temporal=0.7` (new in v0.4.3): it removes most of the remaining flicker at no cost.
+
+**Tip:** for the most realistic look, use Style **Cinematic** together with a higher model resolution: copy `Cinematic.ini`
+and set `model_res=1280x720` (or `1920x1080` if you have the fps).
+
+The OptiScaler NR sliders (intensity, style, local tone, local structure, skin) now change the image live. A key in `nr_port.ini` (e.g. `local_tone=0.5`) overrides the slider.
+
+## Which nvngx_dlssnr.dll?
+
+Works with nvngx_dlssnr.dll 310.8 (old model) and 310.9.16 (new, ~2x lighter model, auto-selected; model=large forces the old one). With any other model, NR switches itself off — wait for a port update.
+
+The game keeps running with its normal image. `dlssnr_nr.log` then says "has a different model than this port supports (310.8 / 310.9.16)".
+
+## Best image: NR + FSR 4 on RX 6000
+
+For the best image, combine NR with FSR 4 as the upscaler. FSR 4 does not officially run on RX 6000, but
+[fsr4-shader-performance-overrides](https://github.com/zgauthier2000/fsr4-shader-performance-overrides) makes it work
+there. Get it from that project and follow its instructions; it is not part of this ZIP.
+
+## Known issues (v0.4)
+
+- **Higher network resolutions (1080p / 1440p) can show artefacts, ghosting and odd lighting** in some games, and the visible gain over 540p is smaller than expected. We are investigating; 960x540 (Standard) is the recommended setting.
+- Strong settings (intensity 2, tone 2, Cinematic) make the effect much stronger but also increase flicker.
+- Ghosting can appear on fast motion with `nr_split=3/4`; set `nr_split=0` and `edit_temporal=0` in `nr_port.ini` to compare.
+- A few rare crash/edge cases found in an internal code review (feature released while in use, format mismatches, a >500 ms stall during split frames) will be fixed in the next update.
+
 ## It does not work. What now?
 
 Open the file **`dlssnr_nr.log`** in the game folder with Notepad and look at the last lines:
@@ -147,6 +202,8 @@ in lighter scenes, without frame generation** (Fallout 4, 1440p), with even fram
 | The AI model (DLSS Neural Rendering) | **NVIDIA**. It lives in `nvngx_dlssnr.dll`, which you get yourself. |
 | Getting the model to run on AMD RX 6000 | **This project** (`nr_runtime.dll`, `nvngx.dll_dlssnr.dll`, `nr_data`) |
 | Getting it into games (menu, settings) | [**janblade's OptiScaler-DLSSNR**](https://github.com/janblade/OptiScaler-DLSSNR-PreSR-Multipass) and the [OptiScaler](https://github.com/optiscaler/OptiScaler) team, see `docs/CREDITS.md` in the release |
+
+Started in danielblnc's Discord; early versions were based on his gfx1100 kernels — all kernels are now our own.
 
 This project contains no NVIDIA files or weights. DLSS and NVIDIA are trademarks of NVIDIA
 Corporation. This project is not affiliated with or endorsed by NVIDIA or AMD.

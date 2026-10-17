@@ -34,6 +34,8 @@ NR_API int nr_get_strength(nr_ctx*, float* tone, float* structure, float* a, flo
 // One-knob version: intensity 0..2 (clamped). 0 = (0,0,0,0) effect nearly off; 0..1 scales (a,b) from 0 to 1; 1 = default (0,0,1,1);
 // 1..2 moves linearly to (4,4,8,8) = the largest clean look (~3x the effect, +37% local contrast). Returns 2 for NaN/negative.
 NR_API int nr_set_intensity(nr_ctx*, float intensity);
+// NVIDIA's conditioning (style 0..2, local tone / structure 0..2, skin -1 = follow structure, auto mask); intensity is the host's output blend.
+NR_API int nr_set_conditioning(nr_ctx*, int style, float tone, float structure, float skin, int auto_mask);
 NR_API void nr_destroy(nr_ctx*);
 
 // ---- D3D12 interop: GPU-side per-frame sync, no host copies (see handover/game-ready-sync/DESIGN.md).
@@ -73,8 +75,15 @@ NR_API int nr_ext_enqueue2(nr_ctx*, unsigned seq, int max_inflight, int hist_val
 // k_skip for frames that skip dispatches with vit_every > 1). ms (nullable, 4 floats): measured part 1 / part 2 ms for full and skipping frames.
 NR_API int nr_ext_split(nr_ctx*, int* k_full, int* k_skip, float* ms);
 NR_API int nr_ext_enqueue3(nr_ctx*, unsigned seq, int max_inflight, int hist_valid, int part);
+// N-way split (additive): np parts (2..8); k_full / k_skip: np-1 split points each (> 0 fixed, <= 0 measured: ~1/np of the GPU time per part),
+// ms (nullable, 2*np floats): measured part times, full frames then skipping frames. enqueue3 part 1..np: part 1 = input + history + [0, k1),
+// part np = [k(np-1), n) + history out + output. nr_ext_split = nr_ext_splitn(np = 2).
+NR_API int nr_ext_splitn(nr_ctx*, int np, int* k_full, int* k_skip, float* ms);
 // Debug only: run the first n dispatches of each frame (0 = all); read arena bytes (offsets as in meta.json placements).
 NR_API int nr_dbg_steps(nr_ctx*, int n);
 NR_API int nr_dbg_read(nr_ctx*, unsigned long long off, unsigned long long size, void* dst);
 // Log sink for the hardware line at create and the output self-check (default stderr). A failed self-check makes nr_ext_enqueue* return -2.
 NR_API void nr_set_log(void (*cb)(const char*));
+// Optional, before nr_create: luid = the host's D3D12 adapter LUID (8 bytes, ID3D12Device::GetAdapterLuid) or NULL; allow_any = 1 runs on
+// GPUs other than RDNA2 dGPUs (gfx1030-1032). Without it nr_create picks the dGPU with the most CUs.
+NR_API void nr_select_device(const void* luid, int allow_any);
