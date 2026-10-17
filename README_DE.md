@@ -45,13 +45,15 @@ Du brauchst **alles** davon:
 
 | Grafikkarte | Status | Zeit pro Modell-Frame |
 |---|---|---|
-| RX 6800 / 6800 XT / 6900 XT / 6950 XT | ✅ getestet | ~40 ms |
-| RX 6700 / 6700 XT / 6750 XT | 🧪 lädt, von einem User bestätigt (RX 6700 XT); Ergebnis im Spiel wird noch geprüft (v0.2-beta) | ~80 ms (geschätzt) |
-| RX 6600 / 6600 XT / 6650 XT | 🧪 sollte gehen, **ungetestet** (v0.2-beta) | ~110 ms (geschätzt) |
-| RX 6500 XT / 6400 | 🧪 sollte gehen, sehr langsam | 250 ms+ |
+| RX 6900 XT / 6950 XT | ✅ getestet | ~10 ms (gemessen) |
+| RX 6800 / 6800 XT | ✅ läuft (User-Berichte) | ~11-14 ms (geschätzt) |
+| RX 6700 / 6700 XT / 6750 XT | ✅ läuft (User-Berichte) | ~18-20 ms (geschätzt) |
+| RX 6600 / 6600 XT / 6650 XT | ✅ läuft (User-Berichte) | ~25-30 ms (geschätzt) |
+| RX 6500 XT / 6400 | 🧪 sollte gehen, langsam | 50 ms+ (geschätzt) |
 
-**Du hast eine RX 6700 oder RX 6600?** Probier bitte v0.2-beta aus und schreib in [Issues](../../issues),
-ob es geht (mit deiner `dlssnr_nr.log`).
+**v0.4 läuft auf der ganzen RX-6000-Familie (RDNA2).** Erste User-Berichte liegen im Schnitt bei **etwa 55 FPS** im Spiel.
+
+Weitere Berichte gern in [Issues](../../issues) (mit deiner `dlssnr_nr.log`, darin stehen GPU und Zeiten).
 
 Du weißt nicht, welche Grafikkarte du hast? Drück `Strg + Umschalt + Esc`, klick auf **Leistung**, dann
 auf **GPU**. Der Name steht oben rechts.
@@ -64,7 +66,7 @@ Kopier deinen ganzen Spielordner an einen sicheren Ort (zum Beispiel auf den Des
 
 ### Schritt 1: Herunterladen
 
-Geh zu [**Releases**](../../releases/latest) und lade die ZIP (`DLSS5-RDNA2-Experimental-...zip`) herunter. RX 6700 / 6600 / 6500: nimm **v0.2-beta**.
+Geh zu [**Releases**](../../releases/latest) und lade die ZIP (`DLSS5-RDNA2-Experimental-...zip`) herunter. Alle RX-6000-Karten nutzen dieselbe (neueste) ZIP.
 
 ### Schritt 2: NVIDIA-Modelldatei besorgen
 
@@ -192,9 +194,10 @@ Doppelklick im Spielordner auf **`Uninstall_DLSS5.bat`** und `1` drücken. Es en
 
 ## Wird das Spiel schneller oder langsamer?
 
-Es kostet FPS, ist aber seit **v0.3** spielbar. Die AMD-Karte muss Arbeit machen, für die NVIDIA-Karten Spezial-Hardware haben.
-Mit den v0.3-Standardeinstellungen (Modell 960x540, Netz auf zwei Frames verteilt) schafft eine RX 6900 XT etwa **40-45 FPS,
-in leichteren Szenen bis zu 60 FPS, ohne Frame Generation** (Fallout 4, 1440p), mit gleichmäßigen Frametimes. Kleinere Karten sind langsamer (siehe Tabelle oben).
+Es kostet FPS, läuft mit **v0.4** und NVIDIAs neuem Modell aber gut. Die AMD-Karte muss Arbeit machen, für die NVIDIA-Karten Spezial-Hardware haben.
+Mit den v0.4-Standardeinstellungen (Netz 960x540, NVIDIAs neues Modell, Netz auf drei Frames verteilt), gemessen auf einer RX 6900 XT im
+**Cyberpunk-2077-Benchmark bei 1440p, FSR Qualität, ohne Frame Generation: 54,7 FPS auf Hoch, 85,3 FPS auf Niedrig** (v0.3: 43,8 FPS auf Hoch).
+Erste User-Berichte über alle RX-6000-Karten liegen im Schnitt bei **etwa 55 FPS**. Höhere Netz-Auflösungen (Presets HiRes / Native) kosten mehr FPS.
 
 ## Wer hat was gemacht?
 

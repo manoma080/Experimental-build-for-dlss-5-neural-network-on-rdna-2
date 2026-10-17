@@ -42,15 +42,16 @@ You need **all** of these:
 | ✅ Game | A 64-bit DirectX 11 or DirectX 12 game where you can choose **DLSS, FSR or XeSS** in the graphics settings |
 | ✅ NVIDIA model file | `nvngx_dlssnr.dll`. **Not included**, you have to get it yourself (see step 2) |
 
-| Graphics card | Status | Time per model frame |
+| Graphics card | Status (v0.4) | Network time per run, new model, 960x540 |
 |---|---|---|
-| RX 6800 / 6800 XT / 6900 XT / 6950 XT | ✅ tested | ~40 ms |
-| RX 6700 / 6700 XT / 6750 XT | 🧪 loads, confirmed by a user (RX 6700 XT); in-game result still being checked (v0.2-beta) | ~80 ms (estimate) |
-| RX 6600 / 6600 XT / 6650 XT | 🧪 should work, **untested** (v0.2-beta) | ~110 ms (estimate) |
-| RX 6500 XT / 6400 | 🧪 should work, very slow | 250 ms+ |
+| RX 6900 XT / 6950 XT | ✅ tested | ~10 ms (measured) |
+| RX 6800 / 6800 XT | ✅ works (user reports) | ~11-14 ms (estimate) |
+| RX 6700 / 6700 XT / 6750 XT | ✅ works (user reports) | ~18-20 ms (estimate) |
+| RX 6600 / 6600 XT / 6650 XT | ✅ works (user reports) | ~25-30 ms (estimate) |
+| RX 6500 XT / 6400 | 🧪 should work, slow | 50 ms+ (estimate) |
 
-**Have an RX 6700 or RX 6600?** Please try v0.2-beta and tell us in [Issues](../../issues) if it works
-(attach your `dlssnr_nr.log`).
+**v0.4 runs on the whole RX 6000 (RDNA2) family.** First user reports average **about 55 FPS** in game. More reports
+are welcome in [Issues](../../issues) (attach your `dlssnr_nr.log`, it lists your GPU and timings).
 
 Not sure which graphics card you have? Press `Ctrl + Shift + Esc`, click **Performance**, click **GPU**.
 The name is in the top right corner.
@@ -63,7 +64,7 @@ Copy your whole game folder somewhere safe (for example to your desktop). If som
 
 ### Step 1: Download
 
-Go to [**Releases**](../../releases/latest) and download the ZIP (`DLSS5-RDNA2-Experimental-...zip`). RX 6700 / 6600 / 6500: take **v0.2-beta**.
+Go to [**Releases**](../../releases/latest) and download the ZIP (`DLSS5-RDNA2-Experimental-...zip`). Every RX 6000 card uses the same (latest) ZIP.
 
 ### Step 2: Get the NVIDIA model file
 
@@ -191,9 +192,10 @@ In the game folder, double-click **`Uninstall_DLSS5.bat`** and press `1`. It rem
 
 ## Is this faster or slower?
 
-It costs FPS, but since **v0.3** it is playable. The AMD card has to do work that NVIDIA cards have special hardware for.
-With the v0.3 defaults (960x540 model, network split over two frames) an RX 6900 XT reaches about **40-45 FPS, and up to 60 FPS
-in lighter scenes, without frame generation** (Fallout 4, 1440p), with even frame pacing. Smaller cards are slower (see the table above).
+It costs FPS, but with **v0.4** and NVIDIA's new model it runs well. The AMD card has to do work that NVIDIA cards have special hardware for.
+With the v0.4 defaults (960x540 network, NVIDIA's new model, network split over three frames), measured on an RX 6900 XT in the
+**Cyberpunk 2077 benchmark at 1440p, FSR Quality, no frame generation: 54.7 FPS on High, 85.3 FPS on Low** (v0.3: 43.8 FPS on High).
+First user reports across RX 6000 cards average **about 55 FPS**. Higher network resolutions (presets HiRes / Native) cost more FPS.
 
 ## Who made what?
 
