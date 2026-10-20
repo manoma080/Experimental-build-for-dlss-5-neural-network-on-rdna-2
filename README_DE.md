@@ -54,7 +54,7 @@ Du brauchst **alles** davon:
 |---|---|
 | ✅ Grafikkarte | AMD **RX-6000-Serie**, siehe Tabelle unten. RX 7000/9000, NVIDIA und Intel gehen **nicht**. |
 | ✅ Windows | Windows 10 oder 11, 64-Bit |
-| ✅ AMD-Treiber | Ein aktueller AMD-Adrenalin-Treiber ([Download](https://www.amd.com/de/support/download/drivers.html)) **Sonst nichts:** kein HIP SDK, kein ROCm. |
+| ✅ AMD-Treiber | Ein aktueller AMD-Adrenalin-Treiber ([Download](https://www.amd.com/de/support/download/drivers.html)) **Sonst nichts:** kein HIP SDK, kein ROCm. Mit einem sehr alten Treiber bleibt NR einfach aus (das Spiel läuft weiter); im Log steht dann `cannot load nr_runtime.dll`. |
 | ✅ Spiel | Ein 64-Bit-Spiel mit DirectX 11 oder 12, in dem du in den Grafikeinstellungen **DLSS, FSR oder XeSS** auswählen kannst |
 | ✅ NVIDIA-Modelldatei | `nvngx_dlssnr.dll`. **Nicht dabei**, die musst du dir selbst besorgen (Schritt 2) |
 
@@ -195,6 +195,7 @@ lauffähig. Von dort holen und der Anleitung dort folgen; es ist nicht in diesem
 | Im Log steht | Was tun |
 |---|---|
 | `runtime ready` | Läuft. Prüfe, ob Neural Rendering im `Einfg`-Menü an ist. |
+| `cannot load nr_runtime.dll (error 126)` | Dein AMD-Treiber ist zu alt und hat keine HIP-Laufzeit (`amdhip64_6.dll`). **AMD-Adrenalin-Treiber aktualisieren** (jeder Treiber aus 2025/2026 geht) und neu starten. Das Spiel läuft ohne NR weiter. |
 | `nvngx_dlssnr.dll missing or wrong version` | `nvngx_dlssnr.dll` fehlt im Spielordner oder hat andere Gewichte. Neu besorgen (Schritt 2). |
 | `not an RDNA2 GPU` | Deine Grafikkarte wird nicht unterstützt (siehe „Geht das auf meinem PC?“). |
 | `hipModuleLoad ...` | Deine Karte konnte das Programm nicht laden. Bitte in [Issues](../../issues) mit Log melden. |
