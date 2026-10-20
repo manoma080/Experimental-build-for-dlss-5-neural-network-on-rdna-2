@@ -1,5 +1,88 @@
 # Changelog (DLSS 5 Neural Rendering, AMD RDNA2 port)
 
+## v0.5 (2026-10-20)
+
+**The DLSS 5 look is finally here.** Every earlier version ran the network at 720p or 540p, so its detail blocks (skin pores, cloth, fine contrast) worked at a quarter of NVIDIA's pixels and the effect looked weak. v0.5 runs them at your output resolution.
+
+**Full look (new defaults)**
+- `data_dir=nr_data_h15`, `model_res=auto`: **hybrid mode**. The detail blocks run at your output size (1440p screen: 2560x1440), the main network 1.5x smaller. Near-full DLSS 5 look for about 60 % of the full cost (1440p: 29.7 ms instead of 48 ms network time on an RX 6900 XT).
+- `model_res=auto` now picks the largest step not above your output (it was capped at 720p).
+- In Cyberpunk at 1440p the on/off difference is about 3x larger than with the old 720p default.
+
+**Ghosting and trailing fixed**
+- **Motion vectors in games with an upscaler:** the vectors come at render resolution (e.g. 1707x960 with FSR Quality). They were treated as output pixels, so everything that is moved along them (history, edit stabilisation, nr_split) moved only 2/3 of the way and trailed. Now scaled correctly; `mv_scale=1` again.
+- **ViT reuse (`vit_every=0`) on fast motion:** the reused middle stage was stale and trailed. New `vit_motion_gate=1`: on fast camera moves that frame is computed in full.
+
+**nr_split is clean now (more FPS)**
+- Default `nr_split=2` with new `split_fade=3`: a new network result fades in over 3 frames instead of popping. In the test the visible flicker during a camera pan drops from 9.5 % (no split) to 1.2 %.
+- Halo fix (`halo_fix=1`): no bright halos/ghost copies around thin objects with nr_split.
+
+**Crash fixed**
+- Games could hang or crash when the NR feature was re-created (look preset change in OptiScaler, enabling NR, a history reset after loading). Cause: an out-of-bounds GPU read added with the halo fix.
+
+**Faster**
+- New c64 network kernel: about 20-25 % faster for that part (network about -4 %), output identical.
+
+**Smaller changes**
+- `split_fallback=1`: where the halo fix finds no matching old edit (e.g. a moving person), the area keeps the effect's light and tone instead of dropping to the raw frame.
+- `int8_prepost=1`: post block MLP on int8 (slightly faster, image unchanged at 50 dB).
+
+**Presets**
+- New: `Hybrid_1440` (default), `Hybrid_1440_Fast` (nr_split=3), `Hybrid_1080`, `Hybrid_4K`, `Full_1440`, `Full_1080` (whole network at full size, most detail, slowest).
+- The old presets are in `presets/classic` (720p/540p: much faster, but only a fraction of the effect).
+
+**Measured** (Cyberpunk 2077, RX 6900 XT, 1440p, FSR Quality, Hybrid_1440): about 35 FPS with the full look, clean picture (minimal noise, minimal ghosting).
+
+## v0.4.5 (2026-10-18)
+
+Includes all v0.4.4 fixes (see below), plus a stronger look, debug tools and safer defaults. Same kernels and `nr_data`.
+
+**Fixes**
+- **History at 1280x720 now works.** The network pads 720p to 1344x768, and the history slot was sized for 1280x768, so history silently switched off at 720p (also in v0.4.4). With it on, 720p flicker excess drops from x1.17 to x1.00 in the test.
+- **Recreate hang:** the sync shaders are compiled once per process (bytecode cache), not on every create (about 26 s each before). The exp/expB colour-transfer path is fixed too.
+
+**Stronger look (closer to NVIDIA)**
+- NVIDIA's style grade (Natural / Cinematic) is applied to the network output.
+- `intensity_rule=linear` (default): intensity above 1 extends the edit linearly. `ratio` = the old rule.
+- NVIDIA history rules: `history_gate=0`, `history_filter=catmull`, `history_pad=reflect`.
+- New presets **Showcase_540p / Showcase_1080p** (style 2, intensity 2, local tone 2): about 5x the edit of Standard.
+
+**Debug tools**
+- `dump_frame=N` / `dump_frames=N` write frame inputs/outputs next to the log. `mv_scale` and a one-time `motion:` log line help check motion vectors.
+
+**Defaults (package ini and all presets)**
+- `nr_split=0`. **Known issue:** `nr_split=3` gives more fps, but the shown edit can visibly trail in game. This stays open until a two-frame capture explains it.
+- `history_seed=0` (a per-frame seed caused white noise in game), `vit_every=1` (middle-stage reuse off).
+- Package ini: `model_res=1280x720`, `edit_temporal=0.3`.
+
+## v0.4.4 (2026-10-18)
+
+Fixes from an internal code review, two merged features, a debug view and an investigation of the high model resolutions. Same kernels and `nr_data` as v0.4.
+At the default settings the image is unchanged; in the deterministic tests the output is bit-identical to v0.4.3.
+
+**Fixes**
+- **Crash: a feature freed while the game used it.** If the game evaluated a feature at the moment another feature's load freed it as idle, v0.4.3 could use freed memory. Evaluate now checks again after it takes the lock and shows the native frame.
+- **NR no longer ends for the session on a format or timing hiccup.** OptiScaler turns NR off for good when evaluate returns 0. Format, size and runtime conditions now always pass the live frame through and return success. When the colour and output formats differ (for example R11G11B10 to RGBA16F), the pass-through converts in a small shader instead of failing. It never sets a barrier on an output without UAV access, which could remove the device.
+- **nr_split:** when the first part of a job never ran (a stall of more than 500 ms), its later parts are skipped. Before, they ran on stale data, and the D3D12 side waited for them.
+- **`detail=` now works together with `edit_temporal`.** Before, it was silently ignored there.
+- **`edit_temporal` now also works without `nr_split` / `history`** (motion vectors are bound for it on their own). If the game has no usable motion vectors, or the path cannot use it (game resolution = model resolution with `nr_split=0`), the log says so.
+- **Frame-generation reuse frames** (`fg_mode=1`) now honour `compose=` / `detail=`.
+- **R9G9B9E5 output (RE Engine):** a staging buffer is only freed once no frame in flight can still use it. Before, it was freed immediately when the size changed.
+- **A new D3D12 device** (the game recreated it) gets its own HDR latch and readback buffers. Before, it reused the old device's buffers.
+- **Async fallback:** intensity above 1 is capped at 1 there, as in the main path. Before, the edit was extrapolated linearly.
+- **Self-check:** the startup check now compares the network output with that job's own input. v0.4.3 read the input buffer after the next frame could already have overwritten it, so during camera motion the logged `mean |out-in|` was too high (for example 0.13 in Fallout 4 at 1440p).
+
+**New**
+- **`debug_view`** (`nr_port.ini`): 1 shows the raw network output (upsampled), 2 shows the NR edit x4 + 0.5 (grey = no change). For bug reports.
+- **The host's NR preset picks the model** (merged from branch `nr-preset`). With `model=auto`, OptiScaler's Preset 1 runs the old/large model and every other preset runs the new small one, as NVIDIA's DLL does. `model=small|large` still forces a model.
+- **Colour transfer** (merged from branch `hdr-transfer`; RenoDX's "Control-compatible color transfer", MIT): `transfer_strength` (0 = off = as before), `color_strength`, and `paper_white` for HDR games.
+- **AMDNR forwarder path:** the DLL now also exports the older `dlssnr_call_evaluate` (one shared depth/motion size) and `dlssnr_query_scaling_ratio` (always 1.0, because NR does not upscale), so hosts built on janblade's older forwarder can load it.
+
+**High model resolutions (1080p / 1440p): what the artefacts are**
+- Our network output matches the PyTorch reference implementation (dlssnr-pytorch-flex) at 540p, 1080p and 1440p, both at the default sliders and at style 2 / tone 2 / structure 2 / intensity 2. That is 37-42 dB, edit correlation 0.96-0.99, and the same edit strength. History matches too.
+- At those sliders the reference itself changes the image about 3.5x as much as at the defaults (mean edit 0.055-0.06 vs 0.017), and flicker rises 4-5x. The strong, unstable look is NVIDIA's network at those settings, not the port. The edit strength is about the same at every model resolution, so 1080p / 1440p mostly add fine detail, not a stronger effect.
+- The port's own path adds no resolution-dependent error. At model = game resolution it is bit-identical to the reference network per frame. With `history=1` and these strong sliders the history feeds the strong edit back and it builds up. That is the network's own recurrence, and the reference behaves the same. With strong sliders keep the preset settings (`edit_temporal=0.7`, `nr_split=3`): in the test, flicker at 1080p / 1440p drops from 7.7 / 11.5 % to 1.7 / 2.6 % of pixels.
+
 ## v0.4 (public release, 2026-10-17)
 
 This public release contains everything from the internal builds v0.3.1, v0.4, v0.4.1, v0.4.2 and v0.4.3 listed below.

@@ -1,6 +1,6 @@
 ﻿// Drop-in nvngx.dll_dlssnr.dll that runs the RDNA2 DLSS-NR port through nr_runtime.dll (HIP).
 // Same 12 exports as the shipped vendor-neutral port (see ../INTERFACE.md). Fail-safe: anything unexpected -> evaluate
-// returns 0 ("not run") and the host keeps the native frame.
+// passes the live frame through and returns 1 (OptiScaler ends NR for the session on 0; 0 only for null arguments / exceptions).
 //
 // Sync design (default, sync=1; DESIGN.md): evaluate N records into the host's list: colour -> shared io buffer (compute),
 // WriteBufferImmediate(flag_in = N), a one-thread bounded spin on flag_out >= N, then io output -> `output` (compute).
@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <map>
 #include <thread>
 #include <vector>
 #include <mutex>
@@ -32,13 +33,14 @@
 #include <cmath>
 #include <algorithm>
 #include <d3dcommon.h>
+#include "frame_dump.h"
 
 // ---------------------------------------------------------------- logging / settings
 static CRITICAL_SECTION g_cs; static FILE* g_log; static char g_err[512] = "";
 static std::wstring g_dir;                         // folder of this DLL
-static std::string g_dataDir, g_modelRes = "auto", g_model = "auto", g_logName = "dlssnr_nr.log"; static int g_reuseBn = 0, g_vitEvery = 1, g_settleMs = 20, g_jobTimeoutMs = 3000;
+static std::string g_dataDir, g_modelRes = "auto", g_model = "auto", g_logName = "dlssnr_nr.log"; static float g_vitGate = 1.f; static int g_reuseBn = 0, g_vitEvery = 1, g_settleMs = 20, g_jobTimeoutMs = 3000;
 static std::atomic<int> g_evalCalls{0};
-static float g_intensity = -1.0f;                       // ini override of the host's intensity (output blend towards the NR result, 0..2); <0 = the host's value
+static int g_iRatio = 0;   /* intensity_rule=ratio: old luminance-ratio boost above 1 (default linear) */ static float g_intensity = -1.0f;                       // ini override of the host's intensity (output blend towards the NR result, 0..2); <0 = the host's value
 static float g_iniCond[5] = {NAN, NAN, NAN, NAN, NAN};   // ini overrides: style, local_tone, local_structure, skin_structure, auto_mask; NaN = the host's value
 static std::atomic<bool> g_exiting{false};              // set by atexit: at process exit never join/destroy anything (leak it, the OS reclaims)
 static struct ExitHook { ExitHook() { atexit([] { g_exiting = true; }); } } g_exitHook;
@@ -46,9 +48,11 @@ static int g_apply = 1, g_gate = 1, g_ldrIn = 1, g_hdr = 2; static float g_hdrFr
 static int g_allowAny = 0, g_evictMs = 2000; static int g_sync = 1, g_spinMs = 250, g_maxInflight = 3, g_fg = 0, g_fgWaitMs = 4, g_fgMaxAge = 3, g_mv = 0, g_nrEvery = 1; static float g_mvLo = 0.05f, g_mvHi = 0.25f;
 static int g_busy = 0, g_busyWaitMs = 100;   // busy_mode: 0 wait (CPU waits, bounded, for a free HIP slot), 1 reuse (last NR edit, warped) - never a native frame once NR ran
 static int g_compose = 0; static float g_detail = 1.f;   // compose= add (0: the edit added as is) | nv (1: NVIDIA's intensity) | ratio (2: OkLab matched residual); detail= live-frame detail above the model raster (1 = as is). handover/community-look/README.md
-static float g_pass2Gain = 0.5f; static std::atomic<int> g_live{0}; static UINT g_hdrP0 = 0; static ID3D12Resource* g_hl = nullptr; static float g_hdrKey = 0.18f, g_hdrAdapt = 0.05f, g_hdrBias = 1.f, g_hdrExp = 0.f;   // OptiScaler "2 passes": a later pass (a second feature on pass 1's output) adds its edit at gain * pass2_gain
-static float g_eT = 0.f, g_eL = 0.f; static int g_eFl = 0;   // edit_temporal (blend of the shown edit with the previous one, warped), edit_limit (cap vs local contrast), edit_warp bicubic (flag bit 2)
-static int g_split = 0, g_splitK[2] = {0, 0}; static int g_hist = 0; static float g_hLo = 0.08f, g_hHi = 0.25f;   // history=1: temporal history (previous NR output warped by the game's MVs) into the pre-block's +0x40, see handover/temporal-2026-10-11/DLL.md   // mv_reuse/nr_every: NR every Nth frame, in between the last edit warped by the game's motion vectors   // sync=1: same-frame NR through D3D12<->HIP shared memory (see DESIGN.md); falls back to the async path when unavailable
+static float g_pass2Gain = 0.5f; static UINT g_hdrP0 = 0; static ID3D12Resource* g_hl = nullptr; static ID3D12Device* g_hlDev = nullptr; static ID3D12Resource* g_eRb = nullptr; static uint8_t* g_eRbp = nullptr; /* g_hl / g_eRb (HDR latch + its log readback) belong to g_hlDev */ static float g_hdrKey = 0.18f, g_hdrAdapt = 0.05f, g_hdrBias = 1.f, g_hdrExp = 0.f;   // OptiScaler "2 passes": a later pass (a second feature on pass 1's output) adds its edit at gain * pass2_gain
+static float g_mvK = 1.f; static unsigned g_dumpFrame = 0, g_dumpFrames = 1; static std::vector<DumpItem> g_dumpItems; static std::mutex g_dumpMu;   // dump_frame=N: frame_dump.h
+static float g_eT = 0.f, g_eL = 0.f; static int g_eFl = 0, g_dbg = 0; static float g_tS = 0.f, g_cS = 1.f, g_pw = 1.f;   // transfer_strength / color_strength / paper_white: RenoDX "Control-compatible color transfer" (kSyncHlsl rtx)   // edit_temporal (blend of the shown edit with the previous one, warped), edit_limit (cap vs local contrast), edit_warp bicubic (flag bit 2)
+static int g_fill = 1; static int g_hGate = 0, g_hCR = 1, g_hSeed = 1, g_hZp = 0;   /* history_pad reflect (NVIDIA) | zero (v0.4.3) */   // history_gate (colour gate, 0 = NVIDIA), history_filter catmull (NVIDIA) | bilinear, history_seed frame (NVIDIA) | 0
+static int g_fallback = 1, g_split = 0, g_fade = 0, g_splitK[2] = {0, 0}; static int g_hist = 0; static float g_hLo = 0.08f, g_hHi = 0.25f;   // history=1: temporal history (previous NR output warped by the game's MVs) into the pre-block's +0x40, see handover/temporal-2026-10-11/DLL.md   // mv_reuse/nr_every: NR every Nth frame, in between the last edit warped by the game's motion vectors   // sync=1: same-frame NR through D3D12<->HIP shared memory (see DESIGN.md); falls back to the async path when unavailable
 
 static void logf(const char* fmt, ...) {
     EnterCriticalSection(&g_cs);
@@ -67,6 +71,7 @@ static void loadSettings() {
     GetPrivateProfileStringA("nr", "log", "dlssnr_nr.log", b, sizeof b, narrow(ini).c_str()); g_logName = b;
     g_vitEvery = (int)GetPrivateProfileIntA("nr", "vit_every", 0, narrow(ini).c_str());   // 0/absent = the data dir's meta vit_every (build_plan: new model 3, old 2), else 1
     { char r[32]; GetPrivateProfileStringA("nr", "reuse", "vit", r, sizeof r, narrow(ini).c_str()); g_reuseBn = !_stricmp(r, "bottleneck"); }   // what vit_every>1 reuses
+    { char r[32]; GetPrivateProfileStringA("nr", "vit_motion_gate", "1", r, sizeof r, narrow(ini).c_str()); g_vitGate = (float)atof(r); if (!(g_vitGate >= 0.f)) g_vitGate = 0.f; }   // reuse=bottleneck: a reuse job whose mean |mv| per frame (model px, x nr_split parts: the job's span) is above it runs in full (stale bottleneck = trailing on fast motion); 0 = off
     g_settleMs = (int)GetPrivateProfileIntA("nr", "settle_ms", 20, narrow(ini).c_str());
     g_jobTimeoutMs = (int)GetPrivateProfileIntA("nr", "job_timeout_ms", 3000, narrow(ini).c_str());
     g_apply = (int)GetPrivateProfileIntA("nr", "apply", 1, narrow(ini).c_str());
@@ -81,7 +86,7 @@ static void loadSettings() {
     GetPrivateProfileStringA("nr", "hdr_exposure", "0", b, sizeof b, narrow(ini).c_str()); g_hdrExp = (float)atof(b); if (!(g_hdrExp > 0.f && g_hdrExp < 1000.f)) g_hdrExp = 0.f;   // fixed E (0 = auto)
     GetPrivateProfileStringA("nr", "gate_lo", "0.03", b, sizeof b, narrow(ini).c_str()); g_gateLo = (float)atof(b);
     GetPrivateProfileStringA("nr", "gate_hi", "0.15", b, sizeof b, narrow(ini).c_str()); g_gateHi = (float)atof(b);
-    GetPrivateProfileStringA("nr", "intensity", "-1", b, sizeof b, narrow(ini).c_str()); g_intensity = (float)atof(b); if (!(g_intensity >= 0.f)) g_intensity = -1.f; if (g_intensity > 2.f) g_intensity = 2.f;
+    GetPrivateProfileStringA("nr", "intensity", "-1", b, sizeof b, narrow(ini).c_str()); g_intensity = (float)atof(b); if (!(g_intensity >= 0.f)) g_intensity = -1.f; if (g_intensity > 2.f) g_intensity = 2.f; GetPrivateProfileStringA("nr", "intensity_rule", "linear", b, sizeof b, narrow(ini).c_str()); g_iRatio = _stricmp(b, "ratio") == 0;
     { const char* k[5] = {"style", "local_tone", "local_structure", "skin_structure", "auto_mask"};   // empty = follow the host (OptiScaler menu)
       for (int i = 0; i < 5; i++) { GetPrivateProfileStringA("nr", k[i], "", b, sizeof b, narrow(ini).c_str()); g_iniCond[i] = b[0] ? (float)atof(b) : NAN; } }
     g_sync = (int)GetPrivateProfileIntA("nr", "sync", 1, narrow(ini).c_str());
@@ -95,6 +100,12 @@ static void loadSettings() {
     GetPrivateProfileStringA("nr", "mv_gate_lo", "0.05", b, sizeof b, narrow(ini).c_str()); g_mvLo = (float)atof(b);
     GetPrivateProfileStringA("nr", "mv_gate_hi", "0.25", b, sizeof b, narrow(ini).c_str()); g_mvHi = (float)atof(b);
     g_hist = (int)GetPrivateProfileIntA("nr", "history", 0, narrow(ini).c_str()); g_hist = g_hist < 0 ? 0 : g_hist > 2 ? 2 : g_hist;   // 1 = history into pre- and post-block, 2 = post-block lerp only (runtime hist_valid)
+    g_hGate = (int)GetPrivateProfileIntA("nr", "history_gate", 0, narrow(ini).c_str());
+    g_fallback = (int)GetPrivateProfileIntA("nr", "split_fallback", 1, narrow(ini).c_str()) != 0;   // halo_fix fill with no match: the wide-ring mean edit (light, no detail) instead of none; 0 = v0.5 behaviour
+    g_fill = (int)GetPrivateProfileIntA("nr", "halo_fix", 1, narrow(ini).c_str()) != 0;   // halo_fix=1 (nr_split / mv reuse halos and ghost copies): disocclusion fill + footprint gate, job-frame depth, aged split history post-lerp only; 0 = v0.4.5
+    { char m[16]; GetPrivateProfileStringA("nr", "history_filter", "catmull", m, sizeof m, narrow(ini).c_str()); g_hCR = _stricmp(m, "bilinear") != 0; }
+    { char m[16]; GetPrivateProfileStringA("nr", "history_seed", "frame", m, sizeof m, narrow(ini).c_str()); g_hSeed = _stricmp(m, "0") != 0; }
+    { char m[16]; GetPrivateProfileStringA("nr", "history_pad", "reflect", m, sizeof m, narrow(ini).c_str()); g_hZp = _stricmp(m, "zero") == 0; }
     GetPrivateProfileStringA("nr", "history_gate_lo", "0.08", b, sizeof b, narrow(ini).c_str()); g_hLo = (float)atof(b);
     GetPrivateProfileStringA("nr", "history_gate_hi", "0.25", b, sizeof b, narrow(ini).c_str()); g_hHi = (float)atof(b);
     { char m[16]; GetPrivateProfileStringA("nr", "compose", "add", m, sizeof m, narrow(ini).c_str()); g_compose = !_stricmp(m, "nv") ? 1 : !_stricmp(m, "ratio") ? 2 : 0; }
@@ -104,9 +115,17 @@ static void loadSettings() {
     GetPrivateProfileStringA("nr", "edit_temporal", "0", b, sizeof b, narrow(ini).c_str()); g_eT = (float)atof(b); g_eT = g_eT > 0.f ? (std::min)(g_eT, 0.95f) : 0.f;   // 0 = off (bit-exact); blend weight of the previous shown edit (warped, depth-gated, clamped to the 3x3 range of the current edit)
     GetPrivateProfileStringA("nr", "edit_limit", "0", b, sizeof b, narrow(ini).c_str()); g_eL = (float)atof(b); g_eL = g_eL > 0.f ? (std::min)(g_eL, 100.f) : 0.f;   // 0 = off; |edit| <= edit_limit x (3x3 luma range + 0.02)
     { char m[16]; GetPrivateProfileStringA("nr", "edit_warp", "bilinear", m, sizeof m, narrow(ini).c_str()); g_eFl = !_stricmp(m, "bicubic") ? 4 : 0; }   // with edit_temporal/edit_limit: Catmull-Rom fetches (sharper, more flicker)
+    GetPrivateProfileStringA("nr", "transfer_strength", "0", b, sizeof b, narrow(ini).c_str()); g_tS = (float)atof(b); g_tS = g_tS > 0.f ? (std::min)(g_tS, 1.f) : 0.f;   // 0 = off (bit-exact)
+    GetPrivateProfileStringA("nr", "color_strength", "1", b, sizeof b, narrow(ini).c_str()); g_cS = (float)atof(b); g_cS = g_cS == g_cS ? (std::min)((std::max)(g_cS, 0.f), 1.f) : 1.f;   // with transfer_strength > 0
+    GetPrivateProfileStringA("nr", "paper_white", "1", b, sizeof b, narrow(ini).c_str()); g_pw = (float)atof(b); g_pw = g_pw > 0.01f && g_pw < 100.f ? g_pw : 1.f;   // HDR (hdr_mode) only: scene white divisor
+    g_dbg = (int)GetPrivateProfileIntA("nr", "debug_view", 0, narrow(ini).c_str()); g_dbg = g_dbg == 1 || g_dbg == 2 ? g_dbg : 0;   // 1 raw network output (upsampled), 2 edit x4 + 0.5 (sync path; no compose / gate / temporal / boost)
     { const int i8 = (int)GetPrivateProfileIntA("nr", "int8_prepost", -1, narrow(ini).c_str()); if (i8 >= 0) SetEnvironmentVariableA("NR_INT8_PREPOST", i8 ? "1" : "0"); }   // opt-in int8 post-block MLP; absent = meta (default off)
+    g_dumpFrame = (unsigned)GetPrivateProfileIntA("nr", "dump_frame", 0, narrow(ini).c_str());   // 0 = off; N = dump the main feature's N-th sync frame (colour, depth, motion, output) next to the log
+    { char b2[32]; GetPrivateProfileStringA("nr", "mv_scale", "1", b2, sizeof b2, narrow(ini).c_str()); g_mvK = (float)atof(b2); if (!(g_mvK == g_mvK)) g_mvK = 1.f; }
+    g_dumpFrames =(std::min)((std::max)((unsigned)GetPrivateProfileIntA("nr", "dump_frames", 1, narrow(ini).c_str()), 1u), 8u);   // consecutive frames from dump_frame on (2: check the vectors, frame f0 warped by f1's motion vs f1)
     g_split = (int)GetPrivateProfileIntA("nr", "nr_split", 0, narrow(ini).c_str()); g_split = g_split <= 0 ? 0 : g_split == 1 ? 2 : (std::min)(g_split, 8);   // N >= 2: the network in N parts over N frames (1 = 2, as before), output = last finished NR, warped
     if (g_split) g_nrEvery = g_split;
+    g_fade = g_split ? (std::min)((std::max)((int)GetPrivateProfileIntA("nr", "split_fade", 3, narrow(ini).c_str()), 0), 8) : 0;   // nr_split: a new job's edit fades in over N shown frames (teb: history weight (N-k)/(N-k+1) on frame k after it landed = linear k/N); 0 = off (bit-exact)
     GetPrivateProfileStringA("nr", "nr_split_k", "0", b, sizeof b, narrow(ini).c_str()); g_splitK[0] = g_splitK[1] = 0; sscanf_s(b, "%d,%d", &g_splitK[0], &g_splitK[1]);   // first dispatch of part 2 (full[,skipping] frames); 0 = measure
     { char m[16]; GetPrivateProfileStringA("nr", "busy_mode", "wait", m, sizeof m, narrow(ini).c_str()); g_busy = !_stricmp(m, "reuse"); }
     g_busyWaitMs = (int)GetPrivateProfileIntA("nr", "busy_wait_ms", 100, narrow(ini).c_str()); g_busyWaitMs = g_busyWaitMs < 0 ? 0 : g_busyWaitMs > 1000 ? 1000 : g_busyWaitMs;
@@ -200,7 +219,7 @@ static const char* kSyncHlsl =
 "GC RWByteAddressBuffer st : register(u2);\n"
 "cbuffer C : register(b0) { uint W; uint H; uint seq; uint maxIt; uint outOff; uint flagOff; float gain; uint FWH; uint minSeq; float gLo; float gHi; uint gate; uint frame; uint maxAge;\n"
 "  uint mvOn; float mvSx; float mvSy; uint mWH; uint mBase; uint dWH; uint dBase; uint dFl; float mLo; float mHi;\n"
-"  uint histOff; uint hPWH; uint histOk; uint hMv; float hLo; float hHi; float tmap; uint histOut; uint split; uint hdrM; float hk; float hx; float hkb; float hA; float amp; uint cm; float dt; float eT; float eL; uint tFl; };\n"   // history: io offset of the PAD_W x PAD_H RGB32F slot, padded size, CPU says the previous frame was NR, motion usable, colour gate   // mv reuse: motion (t1) / depth (t2) size and subrect base (x | y << 16); dFl bit0 depth present, bit1 depth inverted
+"  uint histOff; uint hPWH; uint histOk; uint hMv; float hLo; float hHi; float tmap; uint histOut; uint split; uint hdrM; float hk; float hx; float hkb; float hA; float amp; uint cm; float dt; float eT; float eL; uint tFl; float tS; float cS; float pw; uint jobSeq; uint dbg; uint sy; float sT; float fW; uint mvc; uint mvg; };\n"   // history: io offset of the PAD_W x PAD_H RGB32F slot, padded size, CPU says the previous frame was NR, motion usable, colour gate   // mv reuse: motion (t1) / depth (t2) size and subrect base (x | y << 16); dFl bit0 depth present, bit1 depth inverted
 "Texture2D<float4> mot : register(t1);\n"
 "Texture2D<float> dep : register(t2);\n"   // minSeq != 0: fg mode, reuse the edit captured from a frame >= minSeq;   // W,H model; FWH = frame W | H << 16
 "RWByteAddressBuffer ob : register(u3);\n"
@@ -211,7 +230,7 @@ static const char* kSyncHlsl =
 "  return q.r | (q.g << 9) | (q.b << 18) | ((uint)e << 27); }\n"
 "float3 boost(float4 c, float3 v);\n"
 "void put(uint2 p, float4 v) {\n"
-"  if (amp > 1.0 && any(v.rgb != col[p].rgb)) v.rgb = boost(col[p], v.rgb);\n"
+"  if (dbg == 0 && abs(amp) > 1.0 && any(v.rgb != col[p].rgb)) v.rgb = boost(col[p], v.rgb);\n"
 "#ifdef PACKED\n"
 "  ob.Store(p.y * ((((FWH & 0xFFFF) * 4) + 255) & ~255) + p.x * 4, e5(v.rgb));\n"
 "#else\n"
@@ -226,6 +245,19 @@ static const char* kSyncHlsl =
 "  float4 v[4]; for (int i = 0; i < 4; i++) v[i] = float4(f16tof32(q[i].x & 0xFFFF), f16tof32(q[i].x >> 16), f16tof32(q[i].y & 0xFFFF), f16tof32(q[i].y >> 16));\n"
 "  return lerp(lerp(v[0], v[1], t.x), lerp(v[2], v[3], t.x), t.y); }\n"
 "float4 sn(float4 v) { return float4(san(v.x), san(v.y), san(v.z), san(v.w)); }\n"
+// Style (sy 1 Natural, 2 Cinematic): NVIDIA's cg2r_post_process_kernel grades the network answer before the intensity blend
+// (OpenDLSS-NR demo/shaders/nr_composite.comp nrStyle, MIT): exposure / smoothstep contrast per channel, then an HSL saturation
+// scale, all x clamp(local tone, 0, 1). Natural: -0.1 EV, -0.25 contrast, -10% saturation; Cinematic: -15% saturation.
+// ponytail: the reference's identity exp2(log2()) round trips (f32 rounding only) are left out.
+"float hue1(float p, float q, float h) { h = frac(h); return h < 1.0 / 6.0 ? p + (q - p) * 6.0 * h : h < 0.5 ? q : h < 2.0 / 3.0 ? p + (q - p) * (2.0 / 3.0 - h) * 6.0 : p; }\n"
+"float4 sty(float4 v) {\n"
+"  if (sy == 0) return v; float t = saturate(sT), ex = sy == 1 ? -0.1 * t : 0.0, co = sy == 1 ? -0.25 * t : 0.0, sa = sy == 1 ? -0.1 * t : -0.15 * t;\n"
+"  float3 e = saturate(saturate(v.rgb) * exp2(ex)), c = saturate(e + co * (e * e * (3.0 - 2.0 * e) - e));\n"
+"  float hi = max(c.r, max(c.g, c.b)), lo = min(c.r, min(c.g, c.b)), l = (hi + lo) * 0.5; if (hi <= lo) return float4(c, v.a);\n"
+"  float d = hi - lo, s = l > 0.5 ? d / (2.0 - hi - lo) : d / (hi + lo), h = hi == c.r ? (c.g - c.b) / d + (c.g < c.b ? 6.0 : 0.0) : hi == c.g ? (c.b - c.r) / d + 2.0 : (c.r - c.g) / d + 4.0;\n"
+"  h /= 6.0; s = saturate(s * (sa + 1.0)); if (s <= 0.0) return float4(l, l, l, v.a);\n"
+"  float q = l < 0.5 ? l * (1.0 + s) : l + s - l * s, p = 2.0 * l - q;\n"
+"  return float4(saturate(float3(hue1(p, q, h + 1.0 / 3.0), hue1(p, q, h), hue1(p, q, h - 1.0 / 3.0))), v.a); }\n"
 // compose= (cm != 0, handover/community-look/README.md). OkLab with Ottosson's constants, for the ratio mode. The ratio mode adapts
 // NvidiaResidualModel from janblade's OptiScaler-F5-DLSSNR (GPL-3, shaders/dlssnr/precompile/dlssnr.hlsl); the nv mode follows
 // dlssnr-pytorch layers/pre_post.py compose(); its intensity > 1 rule is boost() below (one implementation, cb[38] amp).
@@ -246,7 +278,7 @@ static const char* kSyncHlsl =
 // and comes back as Ti(T(live) + gain * edit). hdrM 0 off, 1 on, 2 auto: on once lat has latched st[16] (imp counts pixels > 1 into st[20]; lat latches when one frame had >= hdrM >> 2 of them, then resets the count).
 // Off, every path below is the old LDR code (bit-exact).
 "bool hd() { return hdrM == 1 || ((hdrM & 3) == 2 && st.Load(16) != 0) || ((hdrM & 3) == 3 && hl.Load(0) != 0); }\n"
-"float Ex() { if (hx > 0.0) return hx; float e = asfloat(hl.Load(4)); return e > 0.0 ? e : 1.0; }\n"   // HDR exposure: hx fixed (extra pass 1, hdr_exposure), else the metered E lat keeps in hl[4]
+"float Ex() { if (hx > 0.0) return hx / pw; float e = asfloat(hl.Load(4)); return (e > 0.0 ? e : 1.0) / pw; }\n"   // paper_white pw (HDR only, 1 = as before): scene white divisor; encode, decode, gates and history all go through T/Ti, so they stay in one space   // HDR exposure: hx fixed (extra pass 1, hdr_exposure), else the metered E lat keeps in hl[4]
 "float3 T(float3 x) { x = max(x * Ex(), 0.0); x = x / (1.0 + x); return lerp(1.055 * pow(x, 1.0 / 2.4) - 0.055, x * 12.92, step(x, 0.0031308)); }\n"
 "float3 Ti(float3 y) { y = saturate(y); float3 z = lerp(pow((y + 0.055) / 1.055, 2.4), y / 12.92, step(y, 0.04045)); z = min(z, 0.999); return z / (1.0 - z) / Ex(); }\n"   // <= 999: finite for e5 / half
 "float3 L(float4 c) { return hd() ? T(sn(c).rgb) : sn(c).rgb; }\n"   // live colour in network space (gates)
@@ -256,9 +288,25 @@ static const char* kSyncHlsl =
 // channels apart: chroma shift x2 at intensity 2). Over-range: the peak channel is brought back by one scalar (hue kept), not clamped per channel.
 "float3 boost(float4 c, float3 v) {\n"
 "  float3 a = L(c), b = hd() ? T(max(v, 0.0)) : max(v, 0.0); const float3 w = float3(0.2126, 0.7152, 0.0722);\n"
-"  float r = max((dot(b, w) + 1.0 / 512.0) / (dot(a, w) + 1.0 / 512.0), 1e-6); float3 o = b * (clamp(pow(r, amp), 0.5, 2.0) / r);\n"
-"  float m = max(o.r, max(o.g, o.b)), lim = max(1.0, max(b.r, max(b.g, b.b))); if (m > lim) o *= lim / m;\n"
+"  float3 o; float lim = max(1.0, max(b.r, max(b.g, b.b)));\n"
+"  if (amp > 0.0) o = clamp(a + amp * (b - a), 0.0, lim);\n"   // linear (default, OpenDLSS-NR): proxy + I (styled - proxy), clamped to the valid range
+"  else { float r = max((dot(b, w) + 1.0 / 512.0) / (dot(a, w) + 1.0 / 512.0), 1e-6); o = b * (clamp(pow(r, -amp), 0.5, 2.0) / r);\n"   // intensity_rule=ratio (amp < 0): old luminance-ratio boost
+"  float m = max(o.r, max(o.g, o.b)); if (m > lim) o *= lim / m; }\n"
 "  return hd() ? min(Ti(o), (1.0 + hk) * max(sn(c).rgb, 0.0) + 0.1 * hk / Ex()) : o; }\n"
+// transfer_strength tS (0 = off, bit-exact): RenoDX dlss5's "Control-compatible color transfer" (its legacy/v6 divisor codec, MIT,
+// github.com/Yukikaze20170315/RenoDX-DLSS5-Generic shaders/legacy_common.hlsli ResolvePixel + UpgradeToneMap; Copyright (c) 2025 Carlos Lopez Jr.,
+// MIT licence; the same UpgradeToneMap is OpenDLSS-NR demo/shaders/nr_composite.comp). Linear light: O = live colour
+// (HDR: x E, LDR: sRGB-decoded frame), P / N = sRGB-decoded network input / answer at this pixel. Below the proxy: N x O_y / P_y (the edit as a
+// luminance ratio, the full-res frame's own detail rides on the network's tone); above it: the excess O - P added back (RenoDX: N_y + (O_y - P_y)). color_strength cS:
+// 0 = only the luminance change on the live colour (ratio clamped 0..4), 1 = the network's colour. Shown = lerp(today's compose, this, tS).
+// ponytail: HueOkLab(N * r, N) == N * r for r >= 0 (OkLab chroma scales with the cube root like L), so it is left out.
+"float3 lin(float3 v) { v = max(v, 0.0); return lerp(pow((v + 0.055) / 1.055, 2.4), v / 12.92, step(v, 0.04045)); }\n"
+"float3 enc(float3 v) { v = max(v, 0.0); return lerp(1.055 * pow(v, 1.0 / 2.4) - 0.055, v * 12.92, step(v, 0.0031308)); }\n"
+"float3 rtx(float4 c, float3 a, float3 b) { const float3 w = float3(0.212639, 0.715169, 0.072192); bool h = hd();\n"
+"  float3 O = h ? max(sn(c).rgb, 0.0) * Ex() : lin(sn(c).rgb), P = lin(saturate(a)), N = lin(saturate(b)), U = O; float oy = dot(O, w), py = dot(P, w), ny = dot(N, w);\n"
+"  if (ny > 1e-5) U = oy >= py ? N + max(O - P, 0.0) : N * (oy / max(py, 1e-6));\n"   // above: RenoDX scales N to N_y + (O_y - P_y); per channel here (same luminance when O >= P per channel), because our input clips per channel and N has lost the hue of a > 1 pixel
+"  U = lerp(O * (oy > 0.0 ? clamp(dot(U, w) / oy, 0.0, 4.0) : 1.0), U, cS);\n"
+"  return h ? min(U / Ex(), (1.0 + hk) * max(sn(c).rgb, 0.0) + 0.1 * hk / Ex()) : enc(U); }\n"   // HDR: same highlight cap as cmp
 "float4 ld(float4 v) { v = sn(v); if (hd()) return float4(T(v.rgb), v.a);\n"
 "#ifdef HDR_IN\n"
 "  return v; }\n"
@@ -273,18 +321,29 @@ static const char* kSyncHlsl =
 "    uint2 a = (uint2)q; uint2 b = min(a + 1, uint2(FW - 1, FH - 1)); float2 t = q - a;\n"
 "    r += lerp(lerp(ld(col[a]), ld(col[uint2(b.x, a.y)]), t.x), lerp(ld(col[uint2(a.x, b.y)]), ld(col[b]), t.x), t.y); }\n"
 "  return r * 0.25; }\n"
+"float depAt(float2 uv);\n"
+// tFl bit 512 (nr_split): imp keeps this (the job's) frame depth in st slot 10; cap / hst stamp the finished job's input / P with it. They run N-1 frames
+// later, and the depth bound then is that later frame's: the disocclusion gates of the split edit and of the history compared against depth
+// N-1 frames newer than the content (a cable that moved away left sky depth under its old image -> its stale edit / history passed: ghost copies).
+// HLSL ?: evaluates BOTH operands: the slot-10 load must stay in bounds without bit 512 (st has no slot 10 then; a root UAV has no bounds
+// check -> the read past st page-faulted the GPU (DEVICE_HUNG) once a recreate / extra pass moved what lies behind st). Without 512 it reads st[0].
+"float jobDep(uint2 q) { const bool j = (tFl & 512) != 0; float d = asfloat(st.Load(j ? 256 + 10 * W * H * 8 + (q.y * W + q.x) * 4 : 0)); return j ? d : depAt((q + 0.5) / float2(W, H)); }\n"
 "[numthreads(8,8,1)] void imp(uint3 id : SV_DispatchThreadID) {\n"
 "  if (id.x >= W || id.y >= H) return; uint FW = FWH & 0xFFFF, FH = FWH >> 16;\n"
 "  float4 c = (FW == W && FH == H) ? ld(col[id.xy]) : colAt((id.xy + 0.5) * float2(FW, FH) / float2(W, H));\n"   // frame == model size: clamped as the resampled path (raw > 1 input made block artifacts)
 "  if ((hdrM & 3) == 1 || (hdrM & 3) == 2) { float3 r = sn(col[min((uint2)((id.xy + 0.5) * float2(FW, FH) / float2(W, H)), uint2(FW - 1, FH - 1))]).rgb; if ((hdrM & 3) == 2 && max(r.r, max(r.g, r.b)) > 1.0) st.InterlockedAdd(20, 1);\n"
 "    if (((id.x | id.y) & 7) == 0) { st.InterlockedAdd(24, (uint)(int)round(clamp(log2(max(dot(r, float3(0.2126, 0.7152, 0.0722)), 1e-6)), -12.0, 12.0) * 256.0)); st.InterlockedAdd(28, 1); } }\n"   // auto: scene-linear HDR evidence (an LDR frame has a few % of specks above 1, HDR much more)
-"  io.Store2((id.y * W + id.x) * 8, uint2(pk(c.r, c.g), pk(c.b, c.a))); }\n"
+"  if (mvc != 0) { uint cs = mvg & 255, cw = mvg >> 8; if (id.x == 0 && id.y == 0) io.Store(mvc - 16, seq);\n"   // vit_motion_gate: this frame's tag, one vector per cs x cs cell (its centre pixel), model px
+"    if (id.x % cs == cs / 2 && id.y % cs == cs / 2) { uint2 mn = uint2(mWH & 0xFFFF, mWH >> 16); float2 uv = (id.xy + 0.5) / float2(W, H);\n"
+"      float2 m = mot[uint2(mBase & 0xFFFF, mBase >> 16) + min((uint2)(uv * mn), mn - 1)].xy * float2(mvSx, mvSy) * float2(W, H) / float2(FW, FH); io.Store2(mvc + ((id.y / cs) * cw + id.x / cs) * 8, asuint(m)); } }\n"
+"  io.Store2((id.y * W + id.x) * 8, uint2(pk(c.r, c.g), pk(c.b, c.a))); if (tFl & 512) st.Store(256 + 10 * W * H * 8 + (id.y * W + id.x) * 4, asuint(depAt((id.xy + 0.5) / float2(W, H)))); }\n"
 "[numthreads(1,1,1)] void lat() { if ((hdrM & 3) == 2) { if (st.Load(20) >= (hdrM >> 2)) st.Store(16, 1u); st.Store(20, 0u); hl.Store(0, st.Load(16)); }\n"
 "  uint n = st.Load(28); float e = asfloat(hl.Load(4)); if (n) { float t = clamp(hkb * exp2(-(float)(int)st.Load(24) / (256.0 * n)), 1.0 / 1024.0, 16.0); e = e > 0.0 ? exp2(lerp(log2(e), log2(t), hA)) : t; }\n"
 "  st.Store(24, 0u); st.Store(28, 0u); hl.Store(4, asuint(e)); }\n"   // hdr_mode auto: latch HDR at the start of a frame (sticky for the feature)
 "[numthreads(1,1,1)] void spin() {\n"
+"  if (jobSeq != 0 && jobSeq != seq && st.Load(32) != jobSeq) { st.Store(0, 0u); return; }\n"   // nr_split: part 1 of this job (seq jobSeq) never finished -> the runtime skips its later parts (job_ok): do not wait for them
 "  uint v = 0; for (uint i = 0; i < maxIt; i++) { io.InterlockedOr(flagOff, 0, v); if ((int)(v - seq) >= 0) break; }\n"
-"  st.Store(0, (int)(v - seq) >= 0 ? 1u : 0u); }\n"
+"  st.Store(0, (int)(v - seq) >= 0 ? 1u : 0u); if (jobSeq == seq && (int)(v - seq) >= 0) st.Store(32, seq); }\n"
 "float depAt(float2 uv) {\n"   // far-is-zero depth at image uv (0 = no depth): reversed Z as is, standard Z as 1 - d (as janblade's detail reuse)
 "  if ((dFl & 1) == 0) return 0; uint2 n = uint2(dWH & 0xFFFF, dWH >> 16); float d = dep[uint2(dBase & 0xFFFF, dBase >> 16) + min((uint2)(uv * n), n - 1)];\n"
 "  return (dFl & 2) ? d : 1.0 - d; }\n"
@@ -295,8 +354,8 @@ static const char* kSyncHlsl =
 "  return lerp(lerp(v[0], v[1], t.x), lerp(v[2], v[3], t.x), t.y); }\n"
 "[numthreads(8,8,1)] void cap(uint3 id : SV_DispatchThreadID) {\n"   // fg: keep the NR edit (out - in, model size) of a finished frame at st+256
 "  if (id.x >= W || id.y >= H || st.Load(0) == 0) return; uint o = (id.y * W + id.x) * 8;\n"
-"  float4 i = bil(id.xy + 0.5, 0), d = sn(bil(id.xy + 0.5, outOff) - i); st.Store2(256 + o, uint2(pk(d.r, d.g), pk(d.b, 0)));\n"
-"  st.Store2(256 + W * H * 8 + o, uint2(pk(i.r, i.g), pk(i.b, depAt((id.xy + 0.5) / float2(W, H)))));\n"   // + the model input the edit belongs to (motion gate) and its depth
+"  float4 i = bil(id.xy + 0.5, 0), d = sn(sty(bil(id.xy + 0.5, outOff)) - i); st.Store2(256 + o, uint2(pk(d.r, d.g), pk(d.b, 0)));\n"
+"  st.Store2(256 + W * H * 8 + o, uint2(pk(i.r, i.g), pk(i.b, jobDep(id.xy))));\n"   // + the model input the edit belongs to (motion gate) and its depth
 "  if (id.x == 0 && id.y == 0) { st.Store(4, seq); st.Store(8, frame); } }\n"
 "float2 accAt(float2 q, uint f); float2 slotAt(float2 q, uint k);\n"
 // ---- edit stabilisation (edit_temporal / edit_limit / edit_warp, tFl bit0 on). tea: the edit exp would show, at model texel centres
@@ -309,74 +368,106 @@ static const char* kSyncHlsl =
 "    r += w[i].x * w[j].y * float3(f16tof32(u.x & 0xFFFF), f16tof32(u.x >> 16), f16tof32(u.y & 0xFFFF)); }\n"
 "  return r; }\n"
 "float3 jobE(float2 p) { return (tFl & 4) ? stCR(p, 256) : stAt(p, 256).rgb; }\n"
+// disocclusion fill (halo_fix=1, tFl bit 256): where the colour / depth gate rejects the kept edit at its source p (the live pixel shows background the
+// edit's frame had covered: a thin object or an edge moved over it), v0.4.5 showed no edit there -> the raw frame in a band as wide as the motion since the
+// edit's frame: the bright "halo" beside cables / poles / roof edges under nr_split (and mv reuse). Fill: the gate-weighted mean of the kept edit on a ring of
+// 8 taps around p (radius 2, 4, 8, 16 model px x W/1280; the first ring with a match). No match (new content): no edit, as before. w0 > 0.99: unchanged.
+// Same bit: the gates compare the live colour over the model texel footprint (colAt, as imp made the network input) with the kept input, not one frame
+// pixel: a thin dark line (cable) is far darker in the frame than in the model input, so the point gate rejected the edit on every thin structure.
+"float gw(float3 l, float dn, float4 o) { float3 a = abs(l - o.rgb); float w = 1.0 - smoothstep(mLo, mHi, max(a.r, max(a.g, a.b)));\n"
+"  if (dFl & 1) w *= 1.0 - smoothstep(0.05, 0.2, abs(dn - o.a) / max(max(dn, o.a), 1e-6)); return w; }\n"
+"float3 fillE(float2 p, float3 l, float dn, float w0, float3 e0) {\n"
+"  if ((tFl & 256) == 0 || w0 > 0.99) return e0; float3 s = 0; float sw = 0, k = max(1.0, W / 1280.0);\n"
+"  float3 u = 0; float un = 0;\n"
+"  for (int r = 0; r < 4 && sw < 0.5; r++) { s = 0; sw = 0; u = 0; un = 0; for (int i = 0; i < 8; i++) { float2 q = p + float2(cos(i * 0.7853982), sin(i * 0.7853982)) * (k * (2 << r));\n"
+"    if (any(q < 0.0) || any(q > float2(W, H))) continue; float3 eq = stAt(q, 256).rgb; float w = gw(l, dn, stAt(q, 256 + W * H * 8)); s += w * eq; sw += w; u += eq; un += 1.0; } }\n"
+"  if (sw > 0.0) return e0 + (1.0 - w0) * s / sw;\n"
+"  return e0 + ((tFl & 1024) && un > 0.0 ? (1.0 - w0) * u / un : 0.0); }\n"   // split_fallback (tFl bit 10): no match on any ring (a moving character, new content): the plain mean of the kept edit on the widest ring (its light and tone, no detail) instead of no edit, so the region does not flip between NR and the raw frame
 "float4 ld4(uint k, int2 q) { q = clamp(q, 0, int2(W - 1, H - 1)); uint2 u = st.Load2(256 + k * W * H * 8 + (q.y * W + q.x) * 8); return float4(f16tof32(u.x & 0xFFFF), f16tof32(u.x >> 16), f16tof32(u.y & 0xFFFF), f16tof32(u.y >> 16)); }\n"
 "[numthreads(8,8,1)] void tea(uint3 id : SV_DispatchThreadID) {\n"
-"  if (id.x >= W || id.y >= H) return; uint FW = FWH & 0xFFFF, FH = FWH >> 16; float2 uv = (id.xy + 0.5) / float2(W, H), pf = uv * float2(FW, FH); float3 e = 0, l;\n"
-"  if (split != 0) { l = L(col[min((uint2)pf, uint2(FW - 1, FH - 1))]); uint age = frame - st.Load(8);\n"
+"  if (id.x >= W || id.y >= H) return; uint FW = FWH & 0xFFFF, FH = FWH >> 16; float2 uv = (id.xy + 0.5) / float2(W, H), pf = uv * float2(FW, FH); float3 e = 0, l, aM;\n"   // aM: the model input the edit belongs to (detail=)
+"  if (split != 0) { l = L(col[min((uint2)pf, uint2(FW - 1, FH - 1))]); aM = l; uint age = frame - st.Load(8); float3 lg = (tFl & 256) ? colAt(pf).rgb : l;\n"
 "    if ((int)(st.Load(4) - minSeq) >= 0 && age != 0 && ((split & 8) != 0 || age == (split >> 4))) {\n"   // as exp's split branch, at this texel centre
 "      if (mvOn) { uint2 mn = uint2(mWH & 0xFFFF, mWH >> 16); pf += mot[uint2(mBase & 0xFFFF, mBase >> 16) + min((uint2)(uv * mn), mn - 1)].xy * float2(mvSx, mvSy); }\n"
 "      if (split & 2) pf += accAt(pf / float2(FW, FH), frame - 1) * float2(FW, FH);\n"
 "      if (split & 4) pf += slotAt(pf / float2(FW, FH), 5) * float2(FW, FH);\n"
-"      if (all(pf == pf) && all(pf >= 0.0) && all(pf < float2(FW, FH))) { float2 p = pf * float2(W, H) / float2(FW, FH); float4 o = stAt(p, 256 + W * H * 8); float3 a = abs(l - o.rgb);\n"
-"        float wt = 1.0 - smoothstep(mLo, mHi, max(a.r, max(a.g, a.b)));\n"
-"        if (dFl & 1) { float dn = depAt(uv); wt *= 1.0 - smoothstep(0.05, 0.2, abs(dn - o.a) / max(max(dn, o.a), 1e-6)); }\n"
-"        e = wt * jobE(p); } } }\n"
-"  else { float4 i = bil(id.xy + 0.5, 0); l = i.rgb; if (st.Load(0) != 0) e = sn(bil(id.xy + 0.5, outOff) - i).rgb; }\n"   // full NR frame: out - in
-"  st.Store2(256 + 6 * W * H * 8 + (id.y * W + id.x) * 8, uint2(pk(e.r, e.g), pk(e.b, dot(l, float3(0.2126, 0.7152, 0.0722))))); }\n"
+"      if (all(pf == pf) && all(pf >= 0.0) && all(pf < float2(FW, FH))) { float2 p = pf * float2(W, H) / float2(FW, FH); float4 o = stAt(p, 256 + W * H * 8); float dn = depAt(uv), wt = gw(lg, dn, o);\n"
+"        e = fillE(p, lg, dn, wt, wt * jobE(p)); aM = o.rgb; } } }\n"
+"  else if (st.Load(0) == 0) { l = L(col[min((uint2)pf, uint2(FW - 1, FH - 1))]); aM = l; uint age = frame - st.Load(8); float3 lg = (tFl & 256) ? colAt(pf).rgb : l;\n"   // reuse frame (HIP busy / nr_every): the last captured edit, as exp's reuse branches take it
+"    if (minSeq != 0 && (int)(st.Load(4) - minSeq) >= 0 && age <= maxAge) {\n"
+"      if (tFl & 16) { uint2 mn = uint2(mWH & 0xFFFF, mWH >> 16); pf += mot[uint2(mBase & 0xFFFF, mBase >> 16) + min((uint2)(uv * mn), mn - 1)].xy * float2(mvSx, mvSy); }\n"   // ponytail: one frame of vectors, as mv reuse (exact for age 1)
+"      if (all(pf == pf) && all(pf >= 0.0) && all(pf < float2(FW, FH))) { float2 p = pf * float2(W, H) / float2(FW, FH); float4 o = stAt(p, 256 + W * H * 8); float3 a = abs(lg - o.rgb); float g = max(a.r, max(a.g, a.b));\n"
+"        float wt = (tFl & 16) ? 1.0 - smoothstep(mLo, mHi, g) : gate ? 1.0 - smoothstep(gLo, gHi, g) : 1.0;\n"
+"        if ((tFl & 16) && (dFl & 1)) { float dn = depAt(uv); wt *= 1.0 - smoothstep(0.05, 0.2, abs(dn - o.a) / max(max(dn, o.a), 1e-6)); }\n"
+"        e = (tFl & 16) ? fillE(p, lg, depAt(uv), wt, wt * jobE(p)) : wt * jobE(p) * (1.0 - (float)age / (maxAge + 1)); aM = o.rgb; } } }\n"   // unwarped (fg branch): fades with age
+"  else { float4 i = bil(id.xy + 0.5, 0); l = i.rgb; aM = l; e = sn(sty(bil(id.xy + 0.5, outOff)) - i).rgb; }\n"   // full NR frame: out - in
+"  uint o = (id.y * W + id.x) * 8; st.Store2(256 + 6 * W * H * 8 + o, uint2(pk(e.r, e.g), pk(e.b, dot(l, float3(0.2126, 0.7152, 0.0722)))));\n"
+"  st.Store2(256 + 9 * W * H * 8 + o, uint2(pk(aM.r, aM.g), pk(aM.b, 0))); }\n"
 "[numthreads(8,8,1)] void teb(uint3 id : SV_DispatchThreadID) {\n"
 "  if (id.x >= W || id.y >= H) return; uint FW = FWH & 0xFFFF, FH = FWH >> 16; float2 uv = (id.xy + 0.5) / float2(W, H);\n"
 "  float4 c = ld4(6, id.xy); float3 e = c.rgb, mn = e, mx = e; float lo = c.a, hi = c.a;\n"
 "  for (int j = 0; j < 9; j++) { float4 v = ld4(6, int2(id.xy) + int2(j % 3 - 1, j / 3 - 1)); mn = min(mn, v.rgb); mx = max(mx, v.rgb); lo = min(lo, v.a); hi = max(hi, v.a); }\n"
 "  if (eL > 0.0) { float cap = eL * (hi - lo + 0.02); e = clamp(e, -cap, cap); mn = clamp(mn, -cap, cap); mx = clamp(mx, -cap, cap); }\n"
 "  float dn = depAt(uv);\n"
-"  if (eT > 0.0 && (tFl & 8) != 0 && (mvOn | hMv) != 0) {\n"   // bit3: the CPU ran teb on the frame before (no reset since)
+"  if ((eT > 0.0 || fW > 0.0) && (tFl & 8) != 0 && (tFl & 16) != 0) {\n"   // bit3: the CPU ran teb on the frame before (no reset since); bit4: motion vectors bound
 "    uint2 m2 = uint2(mWH & 0xFFFF, mWH >> 16); float2 pf = uv * float2(FW, FH) + mot[uint2(mBase & 0xFFFF, mBase >> 16) + min((uint2)(uv * m2), m2 - 1)].xy * float2(mvSx, mvSy);\n"
-"    if (all(pf == pf) && all(pf >= 0.0) && all(pf < float2(FW, FH))) { float2 ph = pf * float2(W, H) / float2(FW, FH); uint so = 256 + (7 + ((frame - 1) & 1)) * W * H * 8; float4 h = stAt(ph, so); if (tFl & 4) h.rgb = stCR(ph, so); float w = eT;\n"
+"    if (all(pf == pf) && all(pf >= 0.0) && all(pf < float2(FW, FH))) { float2 ph = pf * float2(W, H) / float2(FW, FH); uint so = 256 + (7 + ((frame - 1) & 1)) * W * H * 8; float4 h = stAt(ph, so); if (tFl & 4) h.rgb = stCR(ph, so); float w = fW > 0.0 ? fW : eT;\n"
 "      if (dFl & 1) w *= 1.0 - smoothstep(0.05, 0.2, abs(dn - h.a) / max(max(dn, h.a), 1e-6));\n"   // disocclusion: current edit only
-"      e = lerp(e, clamp(h.rgb, mn, mx), w); } }\n"
+"      e = lerp(e, fW > 0.0 ? h.rgb : clamp(h.rgb, mn, mx), w); } }\n"
 "  st.Store2(256 + (7 + (frame & 1)) * W * H * 8 + (id.y * W + id.x) * 8, uint2(pk(e.r, e.g), pk(e.b, dn))); }\n"
 "float3 tE(uint2 q) { uint FW = FWH & 0xFFFF, FH = FWH >> 16; float2 p = (q + 0.5) * float2(W, H) / float2(FW, FH); uint so = 256 + (7 + (frame & 1)) * W * H * 8; return (tFl & 4) ? stCR(p, so) : stAt(p, so).rgb; }\n"
-"[numthreads(8,8,1)] void exp(uint3 id : SV_DispatchThreadID) {\n"
-"  uint FW = FWH & 0xFFFF, FH = FWH >> 16; if (id.x >= FW || id.y >= FH) return; float4 c = col[id.xy];\n"
+"float3 tSe(uint2 q, float4 c) { float3 y = L(c), t = tE(q); if (cm == 0) return gain * t; float3 d = ced(y, y, y + t, gain);\n"   // the stabilised edit to show (compose= as for any edit)
+"  if (dt != 1.0) { uint FW = FWH & 0xFFFF, FH = FWH >> 16; d += (dt - 1.0) * (y - stAt((q + 0.5) * float2(W, H) / float2(FW, FH), 256 + 9 * W * H * 8).rgb); }\n"   // detail: vs the model input tea kept (slot 9)
+"  return d; }\n"
+"float4 expB(uint2 id, float4 c, out float3 ta, out float3 td, out uint tk) {\n"   // exp's body: the frame value; tk 1/2: the hdr transfer (tx) applies with ta/td (2: ta = the live proxy), once in exp (one inlined rtx: compile time)
+"  uint FW = FWH & 0xFFFF, FH = FWH >> 16; ta = 0; td = 0; tk = 0;\n"
+"  if (dbg != 0) { float2 p = (id + 0.5) * float2(W, H) / float2(FW, FH); float3 a, b;\n"   // debug_view: 1 raw network output, 2 edit x4 + 0.5 (model raster, bilinear; no compose / gate / temporal)
+"    if (split != 0) { if ((int)(st.Load(4) - minSeq) < 0) { return c; } a = stAt(p, 256 + W * H * 8).rgb; b = a + stAt(p, 256).rgb; }\n"   // split: the last finished job (its input + edit), unwarped
+"    else if (st.Load(0) != 0) { a = sn(bil(p, 0)).rgb; b = sn(bil(p, outOff)).rgb; } else { return c; }\n"
+"    return float4(dbg == 1 ? (hd() ? Ti(b) : b) : (b - a) * 4.0 + 0.5, c.a); }\n"
 "  if (split != 0) {\n"   // nr_split: the last finished NR edit (st+256, job frame st[8]) moved to this frame: by this frame's vectors, + (bit 2) the acc chain of the frame before, + (bit 4) the anchor (job frame -> frame of the edit before); age expected by the CPU in bits 4+
-"    uint age = frame - st.Load(8); if ((int)(st.Load(4) - minSeq) < 0 || age == 0 || ((split & 8) == 0 && age != (split >> 4))) { put(id.xy, c); return; }\n"   // none since the reset yet / not the edit the CPU expects (spin timeout): live frame; bit 8: chain broken, vectors only, any age
-"    if (tFl & 1) { float3 y = L(c); put(id.xy, float4(cmp(c, cm ? ced(y, y, y + tE(id.xy), gain) : gain * tE(id.xy)), c.a)); return; }\n"   // edit stabilisation: the stabilised edit (warped and gated per model texel by tea)
-"    float2 uv = (id.xy + 0.5) / float2(FW, FH), pf = id.xy + 0.5;\n"   // frame px, same arithmetic as the mv reuse branch (age 1 is bit-identical to it)
-"    if (mvOn) { uint2 mn = uint2(mWH & 0xFFFF, mWH >> 16); pf = id.xy + 0.5 + mot[uint2(mBase & 0xFFFF, mBase >> 16) + min((uint2)(uv * mn), mn - 1)].xy * float2(mvSx, mvSy); }\n"
+"    uint age = frame - st.Load(8); if ((int)(st.Load(4) - minSeq) < 0 || age == 0 || ((split & 8) == 0 && age != (split >> 4))) { return c; }\n"   // none since the reset yet / not the edit the CPU expects (spin timeout): live frame; bit 8: chain broken, vectors only, any age
+"    if (tFl & 1) { td = gain * tE(id); tk = 2; return float4(cmp(c, tSe(id, c)), c.a); }\n"   // edit stabilisation: the stabilised edit (warped and gated per model texel by tea)
+"    float2 uv = (id + 0.5) / float2(FW, FH), pf = id + 0.5;\n"   // frame px, same arithmetic as the mv reuse branch (age 1 is bit-identical to it)
+"    if (mvOn) { uint2 mn = uint2(mWH & 0xFFFF, mWH >> 16); pf = id + 0.5 + mot[uint2(mBase & 0xFFFF, mBase >> 16) + min((uint2)(uv * mn), mn - 1)].xy * float2(mvSx, mvSy); }\n"
 "    if (split & 2) pf += accAt(pf / float2(FW, FH), frame - 1) * float2(FW, FH);\n"
 "    if (split & 4) pf += slotAt(pf / float2(FW, FH), 5) * float2(FW, FH);\n"
-"    if (!all(pf == pf) || any(pf < 0.0) || any(pf >= float2(FW, FH))) { put(id.xy, c); return; }\n"   // from off screen: live frame
-"    float2 p = pf * float2(W, H) / float2(FW, FH); float3 e = stAt(p, 256).rgb; float4 o = stAt(p, 256 + W * H * 8); float3 a = abs(L(c) - o.rgb);\n"
-"    float wt = 1.0 - smoothstep(mLo, mHi, max(a.r, max(a.g, a.b)));\n"   // colour gate as mv reuse
-"    if (dFl & 1) { float dn = depAt(uv); wt *= 1.0 - smoothstep(0.05, 0.2, abs(dn - o.a) / max(max(dn, o.a), 1e-6)); }\n"
-"    put(id.xy, float4(cmp(c, cm ? ced(L(c), o.rgb, o.rgb + wt * e, gain) : gain * wt * e), c.a)); return; }\n"
+"    if (!all(pf == pf) || any(pf < 0.0) || any(pf >= float2(FW, FH))) { return c; }\n"   // from off screen: live frame
+"    float2 p = pf * float2(W, H) / float2(FW, FH); float4 o = stAt(p, 256 + W * H * 8); float3 lg = (tFl & 256) ? colAt(id + 0.5).rgb : L(c); float dn = depAt(uv), wt = gw(lg, dn, o);\n"   // colour + depth gate as mv reuse
+"    float3 we = fillE(p, lg, dn, wt, wt * stAt(p, 256).rgb);\n"
+"    { ta = o.rgb; td = gain * we; tk = 1; return float4(cmp(c, cm ? ced(L(c), o.rgb, o.rgb + we, gain) : gain * we), c.a); } }\n"
 "  if (st.Load(0) == 0) {\n"
+"    if (tFl & 1) { td = gain * tE(id); tk = 2; return float4(cmp(c, tSe(id, c)), c.a); }\n"   // reuse frame with edit stabilisation: tea took the reused edit, teb blended it
 "    uint age = frame - st.Load(8);\n"   // fg: frames since the edit's own frame; older than maxAge -> live frame only
 "    if (mvOn != 0 && minSeq != 0 && (int)(st.Load(4) - minSeq) >= 0 && age <= maxAge) {\n"   // mv reuse: the edit moved by the game's vectors (previous = current + mv, frame pixels)
-"      uint2 mn = uint2(mWH & 0xFFFF, mWH >> 16); float2 uv = (id.xy + 0.5) / float2(FW, FH);\n"
-"      float2 pf = id.xy + 0.5 + mot[uint2(mBase & 0xFFFF, mBase >> 16) + min((uint2)(uv * mn), mn - 1)].xy * float2(mvSx, mvSy);\n"
-"      if (any(pf < 0.0) || any(pf >= float2(FW, FH))) { put(id.xy, c); return; }\n"   // came from off screen: live frame
-"      float2 p = pf * float2(W, H) / float2(FW, FH); float3 e = stAt(p, 256).rgb; float4 o = stAt(p, 256 + W * H * 8); float3 a = abs(L(c) - o.rgb);\n"
-"      float wt = 1.0 - smoothstep(mLo, mHi, max(a.r, max(a.g, a.b)));\n"   // colour gate: live vs the edit's own input at the source
-"      if (dFl & 1) { float dn = depAt(uv); wt *= 1.0 - smoothstep(0.05, 0.2, abs(dn - o.a) / max(max(dn, o.a), 1e-6)); }\n"   // depth gate (relative); ponytail: fixed thresholds, add ini keys if a game needs them
-"      put(id.xy, float4(cmp(c, cm ? ced(L(c), o.rgb, o.rgb + wt * e, gain) : gain * wt * e), c.a)); return; }\n"
-"    if (minSeq != 0 && (int)(st.Load(4) - minSeq) >= 0 && age <= maxAge) { float2 p = (id.xy + 0.5) * float2(W, H) / float2(FW, FH);\n"   // fg: live frame + last NR edit
-"      p = clamp(p - 0.5, 0.0, float2(W - 1, H - 1)); uint2 a = (uint2)p; uint2 b = min(a + 1, uint2(W - 1, H - 1)); float2 t = p - a; float3 e[4]; uint2 ix[4] = { a, uint2(b.x, a.y), uint2(a.x, b.y), b };\n"
+"      uint2 mn = uint2(mWH & 0xFFFF, mWH >> 16); float2 uv = (id + 0.5) / float2(FW, FH);\n"
+"      float2 pf = id + 0.5 + mot[uint2(mBase & 0xFFFF, mBase >> 16) + min((uint2)(uv * mn), mn - 1)].xy * float2(mvSx, mvSy);\n"
+"      if (any(pf < 0.0) || any(pf >= float2(FW, FH))) { return c; }\n"   // came from off screen: live frame
+"      float2 p = pf * float2(W, H) / float2(FW, FH); float4 o = stAt(p, 256 + W * H * 8); float3 lg = (tFl & 256) ? colAt(id + 0.5).rgb : L(c); float dn = depAt(uv), wt = gw(lg, dn, o);\n"   // colour gate (live vs the edit's own input at the source) x depth gate (relative); ponytail: fixed thresholds, add ini keys if a game needs them
+"      float3 we = fillE(p, lg, dn, wt, wt * stAt(p, 256).rgb);\n"
+"      { ta = o.rgb; td = gain * we; tk = 1; return float4(cmp(c, cm ? ced(L(c), o.rgb, o.rgb + we, gain) : gain * we), c.a); } }\n"
+"    if (minSeq != 0 && (int)(st.Load(4) - minSeq) >= 0 && age <= maxAge) { float2 p0 = (id + 0.5) * float2(W, H) / float2(FW, FH);\n"   // fg: live frame + last NR edit
+"      float2 p = clamp(p0 - 0.5, 0.0, float2(W - 1, H - 1)); uint2 a = (uint2)p; uint2 b = min(a + 1, uint2(W - 1, H - 1)); float2 t = p - a; float3 e[4]; uint2 ix[4] = { a, uint2(b.x, a.y), uint2(a.x, b.y), b };\n"
 "      for (int i = 0; i < 4; i++) { uint2 q = st.Load2(256 + (ix[i].y * W + ix[i].x) * 8); e[i] = float3(f16tof32(q.x & 0xFFFF), f16tof32(q.x >> 16), f16tof32(q.y & 0xFFFF));\n"
 "        if (gate) { uint2 u = st.Load2(256 + W * H * 8 + (ix[i].y * W + ix[i].x) * 8); float3 o = float3(f16tof32(u.x & 0xFFFF), f16tof32(u.x >> 16), f16tof32(u.y & 0xFFFF));\n"   // motion gate per model pixel: live colour (sampled as imp does) vs the edit's input
 "          float3 l = ((FW == W && FH == H) ? float4(L(col[ix[i]]), 0) : colAt((ix[i] + 0.5) * float2(FW, FH) / float2(W, H))).rgb; float3 a = abs(l - o);\n"
 "          e[i] *= 1.0 - smoothstep(gLo, gHi, max(a.r, max(a.g, a.b))); } }\n"
-"      float3 d = lerp(lerp(e[0], e[1], t.x), lerp(e[2], e[3], t.x), t.y) * (1.0 - (float)age / (maxAge + 1)); put(id.xy, float4(cmp(c, gain * d), c.a)); return; }\n"
-"    put(id.xy, c); return; }\n"
+"      float3 d = lerp(lerp(e[0], e[1], t.x), lerp(e[2], e[3], t.x), t.y) * (1.0 - (float)age / (maxAge + 1));\n"
+"      { td = gain * d; tk = 2; return float4(cmp(c, cm ? ced(L(c), stAt(p0, 256 + W * H * 8).rgb, stAt(p0, 256 + W * H * 8).rgb + d, gain) : gain * d), c.a); } }\n"   // compose= / detail= as the other branches (a = the edit's model input)
+"    return c; }\n"
 "  if (FW != W || FH != H) {\n"     // resampled: carry the model's change (out - in, model size) up to the frame
-"    float2 p = (id.xy + 0.5) * float2(W, H) / float2(FW, FH); float4 d = sn(bil(p, outOff) - bil(p, 0));\n"
-"    if (tFl & 1) { float3 y = L(c); put(id.xy, float4(cmp(c, cm ? ced(y, y, y + tE(id.xy), gain) : gain * tE(id.xy)), c.a)); return; }\n"   // edit stabilisation: the stabilised edit (tea/teb); compose= applies to it as to any edit
-"    put(id.xy, float4(cmp(c, cm ? ced(L(c), sn(bil(p, 0)).rgb, sn(bil(p, outOff)).rgb, gain) : gain * d.rgb), c.a)); return; }\n"                       // timeout: native frame
+"    float2 p = (id + 0.5) * float2(W, H) / float2(FW, FH); float4 d = sn(sty(bil(p, outOff)) - bil(p, 0));\n"
+"    if (tFl & 1) { ta = sn(bil(p, 0)).rgb; td = gain * tE(id); tk = 1; return float4(cmp(c, tSe(id, c)), c.a); }\n"   // edit stabilisation: the stabilised edit (tea/teb); compose= / detail= apply to it as to any edit
+"    { ta = sn(bil(p, 0)).rgb; td = gain * d.rgb; tk = 1; return float4(cmp(c, cm ? ced(L(c), sn(bil(p, 0)).rgb, sn(sty(bil(p, outOff))).rgb, gain) : gain * d.rgb), c.a); } }\n"                       // timeout: native frame
 "  uint2 r = io.Load2(outOff + (id.y * W + id.x) * 8);\n"
-"  float3 e = float3(san(f16tof32(r.x & 0xFFFF)), san(f16tof32(r.x >> 16)), san(f16tof32(r.y & 0xFFFF)));\n"
+"  float3 e = sty(float4(san(f16tof32(r.x & 0xFFFF)), san(f16tof32(r.x >> 16)), san(f16tof32(r.y & 0xFFFF)), 0.0)).rgb;\n"
 "  uint2 q = io.Load2((id.y * W + id.x) * 8); float3 n = float3(f16tof32(q.x & 0xFFFF), f16tof32(q.x >> 16), f16tof32(q.y & 0xFFFF));\n"   // the network's (clamped) input
 "  float3 o = cm ? cmp(c, ced(L(c), n, e, gain)) : hd() ? cmp(c, gain * (e - T(sn(c).rgb))) : c.rgb + gain * (e - n);\n"   // LDR: frame + edit, so pixels above 1 keep their excess
-"  put(id.xy, float4(max(o, 0.0), c.a)); }\n"
+"  { ta = n; td = gain * (e - n); tk = 1; return float4(max(o, 0.0), c.a); } }\n"
+"[numthreads(8,8,1)] void exp(uint3 id : SV_DispatchThreadID) {\n"
+"  uint FW = FWH & 0xFFFF, FH = FWH >> 16; if (id.x >= FW || id.y >= FH) return; float4 c = col[id.xy]; float3 ta, td; uint tk; float4 v = expB(id.xy, c, ta, td, tk);\n"
+"  [branch] if (tk != 0 && tS > 0.0) { if (tk == 2) ta = ((FW == W && FH == H) ? ld(c) : colAt(id.xy + 0.5)).rgb; v.rgb = lerp(v.rgb, rtx(c, ta, ta + td), tS); }\n"   // tx / txp
+"  put(id.xy, v); }\n"
 // ---- temporal history (history=1). hst: after the spin, keep this frame's NR output in proxy space P (+ depth) at st+256+2n.
 // hwp: before the HIP release, write the network's history input into io+histOff (PAD_W x PAD_H x RGB32F, pre-block +0x40): the kept P warped
 // by the game's vectors to this frame (previous = current + mv*mvScale, frame pixels), with colour/depth gates; current P where invalid or reset.
@@ -386,7 +477,7 @@ static const char* kSyncHlsl =
 "  if (id.x == 0 && id.y == 0) st.Store(12, ok ? frame : 0u);\n"   // frame whose output is kept (0 = none)
 "  if (ok == 0) return; uint2 r = io.Load2(outOff + (id.y * W + id.x) * 8);\n"
 "  float3 p = Pf(float3(san(f16tof32(r.x & 0xFFFF)), san(f16tof32(r.x >> 16)), san(f16tof32(r.y & 0xFFFF))));\n"
-"  st.Store2(256 + 2 * W * H * 8 + (id.y * W + id.x) * 8, uint2(pk(p.r, p.g), pk(p.b, depAt((id.xy + 0.5) / float2(W, H))))); }\n"
+"  st.Store2(256 + 2 * W * H * 8 + (id.y * W + id.x) * 8, uint2(pk(p.r, p.g), pk(p.b, jobDep(id.xy)))); }\n"
 "float2 slotAt(float2 q, uint k) {\n"   // nearest fetch of a model-size uv offset field in st slot k (3, 4: acc ping-pong by frame parity, 5: split anchor)
 "  uint2 p = (uint2)clamp(q * float2(W, H), 0.0, float2(W - 1, H - 1)); return asfloat(st.Load2(256 + k * W * H * 8 + (p.y * W + p.x) * 8)); }\n"
 "float2 accAt(float2 q, uint f) { return slotAt(q, 3 + (f & 1)); }\n"   // frame f's accumulated uv offset to the last NR frame
@@ -397,9 +488,19 @@ static const char* kSyncHlsl =
 "  st.Store2(256 + k * W * H * 8 + (id.y * W + id.x) * 8, asuint(m)); }\n"
 "[numthreads(8,8,1)] void acc(uint3 id : SV_DispatchThreadID) { accB(id, 3 + (frame & 1)); }\n"
 "[numthreads(8,8,1)] void anc(uint3 id : SV_DispatchThreadID) { accB(id, 5); }\n"
+"float3 hB(float2 p) {\n"   // bilinear in the runtime's P_{t-1} (io+histOut, PW stride), p in texel units (0 = first texel centre), clamped
+"  uint PW = hPWH & 0xFFFF; p = clamp(p, 0.0, float2(W - 1, H - 1)); uint2 a0 = (uint2)p, b0 = min(a0 + 1, uint2(W - 1, H - 1)); float2 t = p - a0;\n"
+"  float3 v00 = asfloat(io.Load3(histOut + (a0.y * PW + a0.x) * 12)), v10 = asfloat(io.Load3(histOut + (a0.y * PW + b0.x) * 12)), v01 = asfloat(io.Load3(histOut + (b0.y * PW + a0.x) * 12)), v11 = asfloat(io.Load3(histOut + (b0.y * PW + b0.x) * 12));\n"
+"  return lerp(lerp(v00, v10, t.x), lerp(v01, v11, t.x), t.y); }\n"
+"float3 hCR(float2 q) {\n"   // OpenDLSS-NR historySample: 5-tap Catmull-Rom (4 axis taps + centre, bilinear-weight trick) at pixel position q (centres at +0.5)
+"  float2 b = floor(q - 0.5) + 0.5, f = saturate(q - b), s = f * f, c = f * s;\n"
+"  float2 w0 = -0.5 * (f + c) + s, w1 = c * 1.5 - s * 2.5 + 1.0, w3 = (c - s) * 0.5, w2 = 1.0 - w0 - w1 - w3, m = w1 + w2, ce = b + w2 / m - 0.5, lo = b - 1.5, hi = b + 1.5;\n"
+"  float a = w0.x * m.y, bb = w0.y * m.x, cc = m.x * m.y, d = w3.y * m.x, e = w3.x * m.y;\n"
+"  return (hB(float2(lo.x, ce.y)) * a + hB(float2(ce.x, lo.y)) * bb + hB(ce) * cc + hB(float2(ce.x, hi.y)) * d + hB(float2(hi.x, ce.y)) * e) / (a + bb + cc + d + e); }\n"
 "void hwpB(uint3 id, uint age) {\n"
 "  uint PW = hPWH & 0xFFFF, PH = hPWH >> 16; if (id.x >= PW || id.y >= PH) return; uint o = histOff + (id.y * PW + id.x) * 12;\n"
-"  if (id.x >= W || id.y >= H) { io.Store3(o, uint3(0, 0, 0)); return; }\n"   // padding
+"  if ((tFl & 128) && (id.x >= W || id.y >= H)) { io.Store3(o, uint3(0, 0, 0)); return; }\n"   // history_pad=zero (v0.4.3)
+"  int2 rx = int2(id.xy < uint2(W, H) ? (int2)id.xy : 2 * int2(W, H) - (int2)id.xy - 2); id.xy = (uint2)clamp(rx, 0, int2(W, H) - 1);\n"   // padding = reflected copy (the network's own padding; OpenDLSS-NR preprocess), was 0
 "  uint2 r = io.Load2((id.y * W + id.x) * 8); float3 cur = Pf(float3(f16tof32(r.x & 0xFFFF), f16tof32(r.x >> 16), f16tof32(r.y & 0xFFFF))), res = cur;\n"
 "  if (histOk != 0 && st.Load(12) == frame - age) {\n"
 "    uint FW = FWH & 0xFFFF, FH = FWH >> 16; float2 uv = (id.xy + 0.5) / float2(W, H), m = 0;\n"
@@ -407,29 +508,28 @@ static const char* kSyncHlsl =
 "    if (age > 1) m += accAt(uv + m, frame - 1);\n"   // older NR output (nr_every > 1): + the offsets accumulated over the in-between frames
 "    float2 q = uv + m;\n"
 "    if (all(m == m) && all(abs(m) < 0.25) && all(q >= 0.0) && all(q <= 1.0)) {\n"   // off screen / NaN / absurd vector: current
-"      float2 p = clamp(q * float2(W, H) - 0.5, 0.0, float2(W - 1, H - 1)); uint2 a0 = (uint2)p, b0 = min(a0 + 1, uint2(W - 1, H - 1)); float2 t = p - a0;\n"   // bilinear in the runtime's P_{t-1} (io+histOut, PW stride)
-"      float3 v00 = asfloat(io.Load3(histOut + (a0.y * PW + a0.x) * 12)), v10 = asfloat(io.Load3(histOut + (a0.y * PW + b0.x) * 12)), v01 = asfloat(io.Load3(histOut + (b0.y * PW + a0.x) * 12)), v11 = asfloat(io.Load3(histOut + (b0.y * PW + b0.x) * 12));\n"
-"      float4 h = float4(lerp(lerp(v00, v10, t.x), lerp(v01, v11, t.x), t.y), stAt(q * float2(W, H), 256 + 2 * W * H * 8).a); float3 a = abs(h.rgb - cur);\n"
-"      float w = 1.0 - smoothstep(hLo, hHi, max(a.r, max(a.g, a.b)));\n"   // colour disocclusion / wrong vector
+"      float4 h = float4((tFl & 64) ? hCR(q * float2(W, H)) : hB(q * float2(W, H) - 0.5), stAt(q * float2(W, H), 256 + 2 * W * H * 8).a); float3 a = abs(h.rgb - cur);\n"   // tFl bit6: Catmull-Rom (history_filter=catmull, NVIDIA), else bilinear
+"      float w = 1.0 - smoothstep(hLo, hHi, max(a.r, max(a.g, a.b)));\n"   // colour gate (history_gate=1; off = hLo/hHi huge -> w = 1): compares against the input without the edit, so it also rejects where the edit is strong
 "      if (dFl & 1) { float dn = depAt(uv); w *= 1.0 - smoothstep(0.05, 0.2, abs(dn - h.a) / max(max(dn, h.a), 1e-6)); }\n"   // depth disocclusion (as mv reuse)
 "      res = lerp(cur, h.rgb, w); } }\n"
 "  io.Store3(o, asuint(res)); }\n"
 "[numthreads(8,8,1)] void hwp(uint3 id : SV_DispatchThreadID) { hwpB(id, 1); }\n"   // previous frame was NR (bit-exact to the one-frame history)
 "[numthreads(8,8,1)] void hwp2(uint3 id : SV_DispatchThreadID) { hwpB(id, histOk); }\n";   // older NR output (nr_every > 1): histOk = its age in frames
-static const int kSyncRing = 16, kCb = 44;                                     // descriptor pairs (colour SRV, output UAV) in flight
+static const int kSyncRing = 16, kCb = 54;                                     // descriptor pairs (colour SRV, output UAV) in flight
 
 // ---------------------------------------------------------------- feature
 enum { S_LOADING = 0, S_IDLE = 1, S_WAIT_COPY = 2, S_RUNNING = 3, S_FAILED = 4, S_SYNC = 5 };
 struct Sync {                                       // D3D12 side of the sync path; HIP imports io + sig
     ID3D12Resource *io = nullptr, *sig = nullptr, *st = nullptr; HANDLE hIo = nullptr, hSig = nullptr;
     UINT64 ioAlloc = 0, ioSize = 0, sigAlloc = 0, sigSize = 0, outOff = 0, flagOff = 0;
-    ID3D12RootSignature* rs = nullptr; ID3D12PipelineState *imp = nullptr, *spin = nullptr, *exp = nullptr, *cap = nullptr, *expPk = nullptr; ID3D12Resource* ob = nullptr; unsigned obW = 0, obH = 0; ID3D12DescriptorHeap* heap = nullptr; UINT incr = 0;
+    ID3D12RootSignature* rs = nullptr; ID3D12PipelineState *imp = nullptr, *spin = nullptr, *exp = nullptr, *cap = nullptr, *expPk = nullptr; ID3D12Resource* ob = nullptr; ID3D12DescriptorHeap* heap = nullptr; UINT incr = 0;
     unsigned seq = 0; unsigned busy = 0; unsigned ran = 0, rec = 0, reused = 0, minSeq = 1; unsigned frm = 0, frmOf[16] = {}, sinceNr = 0; bool warnedMv = false;
-    ID3D12PipelineState *hwp = nullptr, *hst = nullptr, *acc = nullptr, *hwp2 = nullptr, *lat = nullptr; UINT64 histOff = 0, histOut = 0; float impScale = 0;   // k_import of the data dir: 0 = mode 0 (raw), else its +0x2c scale (mode != 0 tonemaps)
+    ID3D12PipelineState *hwp = nullptr, *hst = nullptr, *acc = nullptr, *hwp2 = nullptr, *lat = nullptr; UINT64 histOff = 0, histOut = 0, mvOff = 0; UINT mvG = 0; float impScale = 0;   // k_import of the data dir: 0 = mode 0 (raw), else its +0x2c scale (mode != 0 tonemaps)
     unsigned waitFails = 0; unsigned padW = 0, padH = 0, lastNrFrm = 0xFFFFFFF0u, accFrm = 0xFFFFFFF0u; bool histOn = false;   // history=1   // fg: frame counter, frame of each in-flight seq (edit age)
     ID3D12PipelineState* anc = nullptr; unsigned np = 0, ancFrm = 0xFFFFFFF0u, ancTo = 0xFFFFFFF0u, ageSum = 0, ageCnt = 0, ageMax = 0, loose = 0;   // nr_split N: parts per job; anchor (st slot 5) = offsets from frame ancFrm to ancTo; edit age stats
-    ID3D12PipelineState *tea = nullptr, *teb = nullptr; unsigned teFrm = 0xFFFFFFF0u;   // edit stabilisation passes, frame teb last ran
-    bool split = false; unsigned part = 0, jobFrm = 0, doneFrm = 0xFFFFFFF0u, accTo = 0xFFFFFFF0u;   // nr_split: next part (0 = start a job), frame of the job in flight / last finished one, NR frame the acc chain points to
+    ID3D12PipelineState *tea = nullptr, *teb = nullptr; unsigned teFrm = 0xFFFFFFF0u, fadeK = 0; bool warnedTe = false;   // edit stabilisation passes, frame teb last ran
+    bool split = false, mvLogged = false; unsigned part = 0, jobFrm = 0, doneFrm = 0xFFFFFFF0u, accTo = 0xFFFFFFF0u, jobSeq = 0;   // nr_split: next part (0 = start a job), frame of the job in flight / last finished one, NR frame the acc chain points to, seq of the job's part 1
+    UINT64 obCap = 0; std::vector<std::pair<ID3D12Resource*, unsigned>> obOld;   // R9G9B9E5 staging: capacity (grow only); replaced buffers + frame, released max_inflight + 2 frames later
 };
 struct Feature;
 static void applyCond(Feature* F); static float curIntensity(Feature* F);
@@ -445,13 +545,25 @@ struct Feature {
     ID3D12Device* dev = nullptr; ID3D12RootSignature* rs = nullptr; ID3D12PipelineState* pso = nullptr; ID3D12DescriptorHeap* heap = nullptr; UINT incr = 0; bool delta = false;
     ID3D12Resource* upOld[2] = {}; uint8_t* upOldp[2] = {}; ID3D12Resource* zero = nullptr; uint8_t* zerop = nullptr;   // old model input per slot (motion gate); all-zero buffer for "no result yet"
     std::atomic<int> inFmt{(int)DXGI_FORMAT_R16G16B16A16_FLOAT}, outFmt{(int)DXGI_FORMAT_R16G16B16A16_FLOAT};   // game texture formats (set by evaluate)
-    int pass = 0;                                                       // 0 = the host's main feature; >0 = an extra pass (created while another feature lives)
+    std::atomic<int> pass{0};                                           // 0 = the host's main feature; >0 = an extra pass: its place in the host's list (passOrder)
     Sync* sy = nullptr;                                                 // non-null: sync resources exist (worker tries nr_ext_open)
     std::mutex mu; std::atomic<DWORD> lastUse{GetTickCount()}; std::atomic<bool> done{false}; std::atomic<bool> evaluated{false};   // mu: evaluate vs eviction; done: worker finished (release-while-loading handoff)
 };
 // Hosts (OptiScaler in MSFS 2024) create features again and again without releasing the old ones. Every live feature
 // holds a runtime context (~1 GB VRAM), so before loading a new one the contexts of features idle for evict_idle_ms are freed.
 static std::mutex g_featMu; static std::vector<Feature*> g_feats;
+// Pass = place in the host's list: OptiScaler evaluates its chain in order on one list (pass 0 on the game's colour, pass n on pass n-1's
+// output). A count of live features at create was wrong whenever the host builds the new chain before it releases the old one (janblade
+// v0.1.32 parks retired features for 32 frames): the new main feature became "extra pass 1" (half gain, no HDR latch) for good.
+// A run = consecutive evaluates on one list without a repeat; a new list or a feature seen again starts the next frame's run.
+static std::mutex g_ordMu; static void* g_ordCmd = nullptr; static std::vector<Feature*> g_ordRun;
+static void passOrder(Feature* F, void* cmd) {
+    std::lock_guard<std::mutex> g(g_ordMu);
+    if (cmd != g_ordCmd || std::find(g_ordRun.begin(), g_ordRun.end(), F) != g_ordRun.end()) { g_ordCmd = cmd; g_ordRun.clear(); }
+    g_ordRun.push_back(F); const int p = (int)g_ordRun.size() - 1;
+    if (F->pass.exchange(p) != p) logf("evaluate %p: %s %d in the host's list (pass2_gain %.2f)", (void*)F, p ? "extra pass" : "main feature, pass", p, g_pass2Gain);
+}
+static void passForget(Feature* F) { std::lock_guard<std::mutex> g(g_ordMu); g_ordRun.erase(std::remove(g_ordRun.begin(), g_ordRun.end(), F), g_ordRun.end()); }   // a new feature at F's address is not "seen"
 static const DXGI_FORMAT kFmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
 static bool fmtOk(DXGI_FORMAT f) { return f == DXGI_FORMAT_R16G16B16A16_FLOAT || f == DXGI_FORMAT_R11G11B10_FLOAT || f == DXGI_FORMAT_R8G8B8A8_UNORM; }
 static unsigned fmtBpp(int f) { return f == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4; }
@@ -506,11 +618,17 @@ static void workerBody(Feature* F) {
         char err[512] = {0};
         if (!loadRuntime()) { F->state = S_FAILED; return; }
         const int ve = g_vitEvery ? g_vitEvery : metaInt(F->dir, "vit_every", 1);
+        // One runtime load at a time: a host that recreates faster than a load takes (slider drag, janblade's epoch rebuilds) had every
+        // released-while-loading feature build its ~1-2 GB context in parallel -> VRAM ran out and the feature that stays got none.
+        // A feature released while it waits here leaves at once (worker() frees its buffers) and never loads.
+        static std::mutex loadMu; std::unique_lock<std::mutex> lk(loadMu, std::defer_lock);
+        while (!lk.try_lock()) { if (F->quit) return; Sleep(5); }
+        if (F->quit) return;
         logf("worker: nr_create(%s, %ux%u, vit_every %d%s%s)...", F->dir.c_str(), F->W, F->H, ve, g_reuseBn ? " bottleneck" : "", g_vitEvery ? "" : " (data dir default)");
         evictIdle(F);
         if (p_select) { LUID l = F->dev->GetAdapterLuid(); p_select(&l, g_allowAny); }   // HIP on the GPU the game renders on (not an iGPU / HIP device 0)
         DWORD t0 = GetTickCount();
-        F->ctx = safeCreate(F->dir.c_str(), (int)F->W, (int)F->H, g_reuseBn && ve > 1 ? -ve : ve, err, sizeof err);
+        F->ctx = safeCreate(F->dir.c_str(), (int)F->W, (int)F->H, g_reuseBn && ve > 1 ? -ve : ve, err, sizeof err); lk.unlock();
         if (!F->ctx) { seterr("nr_create failed: %s", err); F->state = S_FAILED; return; }
         if (F->quit) return;   // released while the runtime was loading: worker() frees it
         logf("worker: runtime ready after %lu ms", GetTickCount() - t0);
@@ -519,8 +637,13 @@ static void workerBody(Feature* F) {
             else if (p_extOpen(F->ctx, F->sy->hIo, F->sy->ioAlloc, F->sy->ioSize, F->sy->outOff, F->sy->flagOff, F->sy->hSig, F->sy->sigAlloc, F->sy->sigSize, err, sizeof err)) logf("sync: nr_ext_open failed (%s) - async path", err);
             else { applyCond(F);
                    if (g_hist) { unsigned pw = 0, ph = 0; int r = p_extHist && p_histLayout && p_extEnqueue2 ? p_histLayout(F->ctx, &pw, &ph) : -1; if (!r) r = p_extHist(F->ctx, F->sy->histOff, F->sy->histOut);
-                       if (r || (UINT64)pw * ph * 12 > F->sy->histOut - F->sy->histOff || (unsigned)pw < F->W || (unsigned)ph < F->H) logf("history: unavailable (%s, code %d) - history off", p_extHist ? "this data dir / runtime cannot take it" : "nr_runtime.dll has no nr_ext_history", r);
-                       else { F->sy->padW = pw; F->sy->padH = ph; F->sy->histOn = true; F->sy->impScale = importScale(F->dir); logf("history: k_import scale %.3g (0 = mode 0, raw colour)", F->sy->impScale); logf("history: mode %d on (warped history io+%llu, runtime output io+%llu, %ux%u RGB32F, gate %.2f..%.2f)", g_hist, F->sy->histOff, F->sy->histOut, pw, ph, g_hLo, g_hHi); } }
+                       if (r || (UINT64)pw * ph * 12 > F->sy->histOut - F->sy->histOff || (unsigned)pw < F->W || (unsigned)ph < F->H) logf("history: unavailable (%s, code %d, pad %ux%u for %ux%u) - history off", p_extHist ? "this data dir / runtime cannot take it" : "nr_runtime.dll has no nr_ext_history", r, pw, ph, F->W, F->H);
+                       else { F->sy->padW = pw; F->sy->padH = ph; F->sy->histOn = true; F->sy->impScale = importScale(F->dir);
+                              { auto sm = (int (*)(nr_ctx*, int))GetProcAddress(GetModuleHandleA("nr_runtime.dll"), "nr_set_seed_mode"); if (sm && g_hSeed) sm(F->ctx, 1); logf("history: noise seed %s, filter %s, colour gate %s", sm && g_hSeed ? "frame counter" : "0", g_hCR ? "catmull" : "bilinear", g_hGate ? "on" : "off"); } logf("history: k_import scale %.3g (0 = mode 0, raw colour)", F->sy->impScale); logf("history: mode %d on (warped history io+%llu, runtime output io+%llu, %ux%u RGB32F, gate %.2f..%.2f)", g_hist, F->sy->histOff, F->sy->histOut, pw, ph, g_hLo, g_hHi); } }
+                   if (ve > 1 && g_reuseBn && g_vitGate > 0.f) { auto em = (int (*)(nr_ctx*, unsigned long long, float, unsigned*, unsigned*))GetProcAddress(GetModuleHandleA("nr_runtime.dll"), "nr_ext_motion"); unsigned cs = 0, cw = 0;
+                       const float gt = g_vitGate / (g_split ? g_split : 1);   // the vectors are per frame; a split job spans nr_split frames
+                       if (em && !em(F->ctx, F->sy->flagOff + 65536, gt, &cs, &cw) && cs && cs < 256 && cw) { F->sy->mvG = cs | (cw << 8); F->sy->mvOff = F->sy->flagOff + 65536; logf("vit reuse: motion gate %.2f model px per job (%.2f per frame, cells %u px)", g_vitGate, gt, cs); }
+                       else logf("vit reuse: no motion gate (%s) - plain bottleneck reuse", em ? "runtime refused" : "nr_runtime.dll has no nr_ext_motion"); }
                    if (g_split) { const int np = g_split > 2 && !p_extSplitN ? 2 : g_split; int kf[8] = {}, ks[8] = {}; float ms[16] = {};
                        if (np == 2) { kf[0] = g_splitK[0]; ks[0] = g_splitK[1] > 0 ? g_splitK[1] : g_splitK[0]; }   // nr_split_k fixes the 2-part point; N > 2: always measured
                        const int r = !p_extEnqueue3 ? -1 : p_extSplitN ? p_extSplitN(F->ctx, np, kf, ks, ms) : p_extSplit ? p_extSplit(F->ctx, kf, ks, ms) : -1;
@@ -556,7 +679,8 @@ static void workerBody(Feature* F) {
                     uint8_t* d = F->upp[slot] + (size_t)y * F->pitch; const uint8_t* sr = F->tout.data() + (size_t)y * F->W * 8;
                     if (F->delta) {                                             // edit = NR(old) - old, half4 (rgb used)
                         const uint16_t* a = (const uint16_t*)sr; const uint16_t* b0 = (const uint16_t*)(F->tin.data() + (size_t)y * F->W * 8); uint16_t* e = (uint16_t*)d;
-                        for (unsigned x = 0; x < F->W * 4; x++) e[x] = f2h(g_gain * curIntensity(F) * (h2f(a[x]) - h2f(b0[x])));
+                        const float gi = g_gain * (std::min)(curIntensity(F), 1.f);   // intensity capped at 1 as the sync path's blend (no linear extrapolation past 1)
+                        for (unsigned x = 0; x < F->W * 4; x++) e[x] = f2h(gi * (h2f(a[x]) - h2f(b0[x])));
                         memcpy(F->upOldp[slot] + (size_t)y * F->pitch, b0, (size_t)F->W * 8); }
                     else if (F->outFmt == (int)DXGI_FORMAT_R11G11B10_FLOAT) for (unsigned x = 0; x < F->W; x++) pack_r11g11b10((const uint16_t*)sr + 4 * x, (uint32_t*)d + x);
                     else if (F->outFmt == (int)DXGI_FORMAT_R8G8B8A8_UNORM) for (unsigned x = 0; x < F->W * 4; x++) { float v = h2f(((const uint16_t*)sr)[x]); d[x] = (uint8_t)(v <= 0.f ? 0 : v >= 1.f ? 255 : v * 255.f + .5f); }
@@ -591,6 +715,7 @@ static bool makeDelta(Feature* F) {
 static void freeSync(Sync* s) {
     if (!s) return;
     for (IUnknown* u : std::initializer_list<IUnknown*>{s->io, s->sig, s->st, s->rs, s->imp, s->spin, s->exp, s->cap, s->expPk, s->ob, s->heap, s->hwp, s->hst, s->acc, s->hwp2, s->lat, s->anc, s->tea, s->teb}) if (u) u->Release();
+    for (auto& o : s->obOld) o.first->Release();
     if (s->hIo) CloseHandle(s->hIo); if (s->hSig) CloseHandle(s->hSig); delete s;
 }
 static ID3D12Resource* sharedBuffer(ID3D12Device* d, UINT64 size, D3D12_HEAP_FLAGS hf, UINT64* alloc) {
@@ -607,9 +732,9 @@ static Sync* makeSync(Feature* F) {
     if (!comp) { logf("sync: d3dcompiler_47.dll missing"); return nullptr; }
     auto* s = new Sync; ID3D12Device* d = F->dev;
     const UINT64 n = (UINT64)F->W * F->H * 8, a = (n + 65535) & ~65535ull;
-    s->outOff = a; s->flagOff = 2 * a; s->ioSize = 2 * a + 65536; s->sigSize = 65536;
-    if (g_hist) { const UINT64 hb = ((UINT64)((F->W + 127) & ~127u) * ((F->H + 127) & ~127u) * 12 + 65535) & ~65535ull; s->histOff = s->ioSize; s->histOut = s->ioSize + hb; s->ioSize += 2 * hb; }   // + history slot (PAD_W x PAD_H RGB32F; PAD = 128-aligned, checked by nr_ext_history)
-    s->io = sharedBuffer(d, s->ioSize, D3D12_HEAP_FLAG_SHARED, &s->ioAlloc); s->sig = sharedBuffer(d, s->sigSize, D3D12_HEAP_FLAG_SHARED, &s->sigAlloc); s->st = sharedBuffer(d, 256 + (g_eT > 0.f || g_eL > 0.f ? 9 : g_split ? 6 : g_hist ? 5 : 2) * n, D3D12_HEAP_FLAG_NONE, nullptr);   // status words | fg edit | its model input (half4, model size each)
+    s->outOff = a; s->flagOff = 2 * a; s->ioSize = 2 * a + 65536 + 262144; s->sigSize = 65536;   // + vit_motion_gate cells at flagOff + 65536 (<= 256 KB)
+    if (g_hist) { const UINT64 hb = ((UINT64)((F->W + 64 + 127) & ~127u) * ((F->H + 64 + 127) & ~127u) * 12 + 65535) & ~65535ull; s->histOff = s->ioSize; s->histOut = s->ioSize + hb; s->ioSize += 2 * hb; }   // + history slot (PAD_W x PAD_H RGB32F; PAD can exceed the 128-aligned size (1280x720 -> 1344x768): +64 margin, checked by nr_ext_history)
+    s->io = sharedBuffer(d, s->ioSize, D3D12_HEAP_FLAG_SHARED, &s->ioAlloc); s->sig = sharedBuffer(d, s->sigSize, D3D12_HEAP_FLAG_SHARED, &s->sigAlloc); s->st = sharedBuffer(d, 256 + (g_split ? 11 : g_eT > 0.f || g_eL > 0.f ? 10 : g_hist ? 5 : 2) * n, D3D12_HEAP_FLAG_NONE, nullptr);   // status words | fg edit | its model input (half4, model size each) | ... | edit stabilisation: 6 tea, 7/8 teb, 9 model input of the edit
     if (!s->io || !s->sig || !s->st) { logf("sync: cannot create shared buffers"); freeSync(s); return nullptr; }
     if (FAILED(d->CreateSharedHandle(s->io, nullptr, GENERIC_ALL, nullptr, &s->hIo)) || FAILED(d->CreateSharedHandle(s->sig, nullptr, GENERIC_ALL, nullptr, &s->hSig))) { logf("sync: CreateSharedHandle failed"); freeSync(s); return nullptr; }
     D3D12_DESCRIPTOR_RANGE rg[2] = {}; rg[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; rg[0].NumDescriptors = 3; rg[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; rg[1].NumDescriptors = 1; rg[1].OffsetInDescriptorsFromTableStart = 3;   // colour, motion, depth | output
@@ -620,12 +745,19 @@ static Sync* makeSync(Feature* F) {
     if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sb, &er)) || FAILED(d->CreateRootSignature(0, sb->GetBufferPointer(), sb->GetBufferSize(), IID_PPV_ARGS(&s->rs)))) { logf("sync: root signature failed"); freeSync(s); return nullptr; }
     sb->Release();
     ID3D12PipelineState** pso[13] = {&s->imp, &s->spin, &s->exp, &s->cap, &s->expPk, &s->lat, &s->hwp, &s->hst, &s->acc, &s->hwp2, &s->anc, &s->tea, &s->teb}; const char* ep[13] = {"imp", "spin", "exp", "cap", "exp", "lat", "hwp", "hst", "acc", "hwp2", "anc", "tea", "teb"};
-    for (int i = 0; i < (g_eT > 0.f || g_eL > 0.f ? 13 : g_split ? 11 : g_hist ? 10 : 6); i++) {
+    for (int i = 0; i < (g_eT > 0.f || g_eL > 0.f || g_fade ? 13 : g_split ? 11 : g_hist ? 10 : 6); i++) {
         ID3DBlob* cs = nullptr; er = nullptr; const char* mac[8] = {}; int nm = 0;   // D3D_SHADER_MACRO[], null-terminated
         if (i == 4) { mac[nm++] = "PACKED"; mac[nm++] = "1"; }                     // expPk
         if (!g_ldrIn) { mac[nm++] = "HDR_IN"; mac[nm++] = "1"; }
-        if ((g_eT > 0.f || g_eL > 0.f) && (i == 2 || i == 4 || i >= 11)) { mac[nm++] = "NC"; mac[nm++] = "1"; }   // exp, expPk, tea, teb
-        if (FAILED(comp(kSyncHlsl, strlen(kSyncHlsl), "nr_sync", nm ? mac : nullptr, nullptr, ep[i], "cs_5_0", 1 << 15, 0, &cs, &er))) { logf("sync: shader %s: %s", ep[i], er ? (char*)er->GetBufferPointer() : "?"); freeSync(s); return nullptr; }
+        if ((g_eT > 0.f || g_eL > 0.f || g_fade) && (i == 2 || i == 4 || i >= 11)) { mac[nm++] = "NC"; mac[nm++] = "1"; }   // exp, expPk, tea, teb
+        // Bytecode cache: the source and macros never change in a process, and exp/expPk take seconds to compile, so a host that
+        // recreates the feature (resolution change, MSFS) compiles once. ponytail: never freed (a few hundred KB).
+        static std::mutex cMu; static std::map<std::string, ID3DBlob*> cache;
+        std::string key = ep[i]; for (int m = 0; m < nm; m++) (key += '|') += mac[m];
+        { std::lock_guard<std::mutex> g(cMu); auto it = cache.find(key); if (it != cache.end()) { cs = it->second; cs->AddRef(); } }
+        if (!cs) {
+            if (FAILED(comp(kSyncHlsl, strlen(kSyncHlsl), "nr_sync", nm ? mac : nullptr, nullptr, ep[i], "cs_5_0", 1 << 15, 0, &cs, &er))) { logf("sync: shader %s: %s", ep[i], er ? (char*)er->GetBufferPointer() : "?"); freeSync(s); return nullptr; }
+            std::lock_guard<std::mutex> g(cMu); if (cache.emplace(key, cs).second) cs->AddRef(); }
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {}; pd.pRootSignature = s->rs; pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
         HRESULT h = d->CreateComputePipelineState(&pd, IID_PPV_ARGS(pso[i])); cs->Release(); if (FAILED(h)) { logf("sync: PSO %s failed", ep[i]); freeSync(s); return nullptr; }
     }
@@ -670,43 +802,46 @@ static std::string sha256Prefix(const std::string& p) {   // first 12 hex digits
     ok = ok && !BCryptFinishHash(h, d, 32, 0); if (h) BCryptDestroyHash(h); if (a) BCryptCloseAlgorithmProvider(a, 0); fclose(f);
     char s[13] = "-"; if (ok) for (int i = 0; i < 6; i++) snprintf(s + 2 * i, 3, "%02x", d[i]); return s;
 }
-// 310.9 carries two models: WEIGHTS_HT (= 310.8) and WEIGHTS_CC_SMALL_FP8 (small, 113M params). nr_port.ini [nr] model=small|large|auto
-// (auto = small when present). How NVIDIA's own DLL chooses is not known; the id names the chosen resource's model.
-static const char* g_res = "WEIGHTS_HT";
-static uint64_t modelIdRaw(const char* p) {
-    if (_stricmp(g_model.c_str(), "large")) if (uint64_t id = nr_model_id(p, "WEIGHTS_CC_SMALL_FP8")) { g_res = "WEIGHTS_CC_SMALL_FP8"; return id; }
-    g_res = "WEIGHTS_HT"; return nr_model_id(p);
+// 310.9 carries two models: WEIGHTS_HT (= 310.8) and WEIGHTS_CC_SMALL_FP8 (small, 113M params). nr_port.ini [nr] model=small|large|auto.
+// NVIDIA's DLL picks the weights by the host's DLSSNR.Hint.Render.Preset (handover/nr-preset.md): its descriptor ids are
+// 1 = WEIGHTS_HT, 2 = WEIGHTS_CC_SMALL_FP8 (310.9 only); any other preset falls back to the shipping default (310.9: 2, 310.8: 1).
+// model=auto does the same: large for preset 1, else small when the DLL has it. The id names the chosen resource's model.
+static bool presetLarge(int preset) { return !_stricmp(g_model.c_str(), "large") || (!_stricmp(g_model.c_str(), "auto") && preset == 1); }
+static uint64_t modelIdRaw(const char* p, bool large, const char** res) {
+    if (!large) if (uint64_t id = nr_model_id(p, "WEIGHTS_CC_SMALL_FP8")) { *res = "WEIGHTS_CC_SMALL_FP8"; return id; }
+    *res = "WEIGHTS_HT"; return nr_model_id(p);
 }
-static uint64_t modelIdSafe(const char* p) { __try { return modelIdRaw(p); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; } }   // truncated / broken PE
+static uint64_t modelIdSafe(const char* p, bool large, const char** res) { __try { return modelIdRaw(p, large, res); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; } }   // truncated / broken PE
 static std::string metaModelId(const std::string& dir) {   // meta.json "model_id": "<16 hex>"; absent = v0.3 data = 310.8
     FILE* f = nullptr; fopen_s(&f, (dir + "\\meta.json").c_str(), "rb"); if (!f) return kModel3108;
     std::string s; char b[4096]; size_t n; while ((n = fread(b, 1, sizeof b, f)) > 0) s.append(b, n); fclose(f);
     size_t k = s.find("\"model_id\""); if (k == std::string::npos) return kModel3108;
     size_t q = s.find('"', s.find(':', k) + 1); return q == std::string::npos ? std::string(kModel3108) : s.substr(q + 1, 16);
 }
-static std::string g_dllId, g_dllDesc;   // the user's DLL: model id ("" = not checked yet, 0...0 = none) and "version x sha256 y"
-static bool pickModelBase(std::string* base) {
-    if (g_dllId.empty()) {
-        std::string from; uint64_t id = 0;
+static std::string g_dllIds[2], g_dllDesc;   // the user's DLL: model id per choice [small, large] ("" = not checked yet, 0...0 = none) and "version x sha256 y"
+static bool pickModelBase(std::string* base, bool large) {
+    std::string& dllId = g_dllIds[large];
+    if (dllId.empty()) {
+        std::string from; uint64_t id = 0; const char* res = "WEIGHTS_HT";
         for (const std::string& d : {narrow(g_dir), g_dataDir + "\\..\\"}) if (GetFileAttributesA((d + "nvngx_dlssnr.dll").c_str()) != INVALID_FILE_ATTRIBUTES) { from = d + "nvngx_dlssnr.dll"; break; }
-        if (!from.empty()) { id = modelIdSafe(from.c_str()); wchar_t w[MAX_PATH] = L""; MultiByteToWideChar(CP_UTF8, 0, from.c_str(), -1, w, MAX_PATH);
+        if (!from.empty()) { id = modelIdSafe(from.c_str(), large, &res); wchar_t w[MAX_PATH] = L""; MultiByteToWideChar(CP_UTF8, 0, from.c_str(), -1, w, MAX_PATH);
                              g_dllDesc = "version " + fileVersion(w) + " sha256 " + sha256Prefix(from); }
         else g_dllDesc = "(not found)";
-        char hx[17]; snprintf(hx, sizeof hx, "%016llx", (unsigned long long)id); g_dllId = hx;
-        logf("model: %s %s, model id %s (%s, model=%s)", from.empty() ? "nvngx_dlssnr.dll" : from.c_str(), g_dllDesc.c_str(), id ? hx : "none (no WEIGHTS_HT / unreadable)", g_res, g_model.c_str());
+        char hx[17]; snprintf(hx, sizeof hx, "%016llx", (unsigned long long)id); dllId = hx;
+        logf("model: %s %s, model id %s (%s, model=%s)", from.empty() ? "nvngx_dlssnr.dll" : from.c_str(), g_dllDesc.c_str(), id ? hx : "none (no WEIGHTS_HT / unreadable)", res, g_model.c_str());
     }
-    const std::string m = g_dataDir + "\\" + g_dllId; const DWORD at = GetFileAttributesA(m.c_str());
+    const std::string m = g_dataDir + "\\" + dllId; const DWORD at = GetFileAttributesA(m.c_str());
     *base = at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY) ? m : g_dataDir;
     return true;
 }
-static bool modelMatches(const std::string& dir) {   // the step dir create picked was built for the user's DLL
-    const std::string want = metaModelId(dir); if (!_stricmp(want.c_str(), g_dllId.c_str())) return true;
-    seterr("nvngx_dlssnr.dll %s has a different model than this port supports (%s). NR stays off; update the port. (DLL model id %s, data %s)",
-           g_dllDesc.c_str(), want == kModel3108 ? "310.8 / 310.9.16" : want.c_str(), g_dllId.c_str(), dir.c_str());
+static bool modelMatches(const std::string& dir, bool large, bool quiet = false) {   // the step dir create picked was built for the user's DLL
+    const std::string want = metaModelId(dir), &dllId = g_dllIds[large]; if (!_stricmp(want.c_str(), dllId.c_str())) return true;
+    if (!quiet) seterr("nvngx_dlssnr.dll %s has a different model than this port supports (%s). NR stays off; update the port. (DLL model id %s, data %s)",
+           g_dllDesc.c_str(), want == kModel3108 ? "310.8 / 310.9.16" : want.c_str(), dllId.c_str(), dir.c_str());
     return false;
 }
-static std::string pickModelDir(unsigned w, unsigned h) {
-    std::string base; if (!pickModelBase(&base)) return "";
+static std::string pickModelDir(unsigned w, unsigned h, bool large) {
+    std::string base; if (!pickModelBase(&base, large)) return "";
     unsigned mw, mh; if (readMeta(base, &mw, &mh)) return base;
     std::vector<std::pair<unsigned, unsigned>> st; WIN32_FIND_DATAA fd; HANDLE fh = FindFirstFileA((base + "\\*x*").c_str(), &fd);
     if (fh != INVALID_HANDLE_VALUE) { do { unsigned a, b; if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && sscanf_s(fd.cFileName, "%ux%u", &a, &b) == 2) st.push_back({a, b}); } while (FindNextFileA(fh, &fd)); FindClose(fh); }
@@ -716,7 +851,11 @@ static std::string pickModelDir(unsigned w, unsigned h) {
     if (want != "auto" && std::none_of(st.begin(), st.end(), [&](const std::pair<unsigned, unsigned>& p) { return name(p.first, p.second) == want; })) { logf("model_res %s: no such step in %s, using auto", want.c_str(), base.c_str()); want = "auto"; }
     if (want == "auto" && !st.empty()) {
         auto best = std::make_pair(1280u, 720u); bool def = std::find(st.begin(), st.end(), best) != st.end(); if (!def) best = st[0];
-        if (h) for (auto& p : st) if (p.second <= 720 && abs((int)p.second - (int)h) < abs((int)best.second - (int)h)) best = p;   // ties keep 1280x720; 1080p / 1440p steps only by explicit model_res (hosts often pass the output size)
+        if (h) {   // the largest step not above the frame (the detail blocks at output size = NVIDIA's look; 2026-10-20), else the smallest
+            bool any = false;
+            for (auto& p : st) if (p.second <= h && (!any || p.second > best.second)) { best = p; any = true; }
+            if (!any) for (auto& p : st) if (p.second < best.second) best = p;
+        }
         want = name(best.first, best.second);
     }
     std::string steps; for (auto& p : st) steps += " " + name(p.first, p.second);
@@ -739,7 +878,10 @@ __declspec(dllexport) const char* dlssnr_backend_id() { return "rdna2-hip"; }   
 __declspec(dllexport) const char* dlssnr_call_error() { return g_err; }
 __declspec(dllexport) int dlssnr_port_state(void* f) { return f ? ((Feature*)f)->state.load() : -1; }   // diagnostics/tests: 0 loading, 1-3 async, 4 failed, 5 sync
 __declspec(dllexport) void dlssnr_port_stats(void* f, unsigned* nr, unsigned* native, unsigned* reused) { Sync* s = f ? ((Feature*)f)->sy : nullptr; *nr = s ? s->ran : 0; *native = s ? s->busy : 0; *reused = s ? s->reused : 0; }   // tests: sync-path frame counts
+__declspec(dllexport) int dlssnr_port_pass(void* f) { return f ? ((Feature*)f)->pass.load() : -1; }   // tests: 0 main feature, > 0 extra pass
 __declspec(dllexport) const char* dlssnr_port_dir(void* f) { return f ? ((Feature*)f)->dir.c_str() : ""; }   // tests: the data dir create picked (model + step)
+static std::atomic<int> g_testEvalDelay{0};   // tests (dlssnr_port_test): hold evaluate between its first state check and its lock for up to this many ms (eviction race); 0 releases
+__declspec(dllexport) void dlssnr_port_test(int evalDelayMs) { g_testEvalDelay = evalDelayMs; }
 __declspec(dllexport) void dlssnr_call_set_float_slot(int) {}
 __declspec(dllexport) void dlssnr_call_probe_float(void*, const char*, float, int) {}
 __declspec(dllexport) void dlssnr_call_set_extras(void*, float, ID3D12Resource*, ID3D12Resource*, ID3D12Resource*, unsigned, unsigned, unsigned, unsigned) {}
@@ -772,26 +914,29 @@ static void applyCond(Feature* F) {
 
 extern "C" {
 __declspec(dllexport) void* dlssnr_call_create(const wchar_t* snippet, const wchar_t*, ID3D12Device* dev, ID3D12GraphicsCommandList*, void*,
-        unsigned w, unsigned h, int, float intensity, int style, float localStructure, float localTone, float skinStructure, int useAutoMask, int) {
+        unsigned w, unsigned h, int preset, float intensity, int style, float localStructure, float localTone, float skinStructure, int useAutoMask, int) {
     try {
         if (!g_log) loadSettings();
-        logf("create: snippet=%ls dev=%p %ux%u", snippet ? snippet : L"", (void*)dev, w, h);
+        logf("create: snippet=%ls dev=%p %ux%u preset %d", snippet ? snippet : L"", (void*)dev, w, h, preset);
         logHost(_ReturnAddress());
         dlssnr_call_last_create = 0;
         if (!dev) { seterr("create: no D3D12 device"); return nullptr; }
-        unsigned mw = 0, mh = 0; const std::string dir = pickModelDir(w, h);
-        if (dir.empty() || !modelMatches(dir)) {   // unknown / missing nvngx_dlssnr.dll: a feature that only passes frames through (returns 1; OptiScaler ends NR on 0)
-            auto* F = new Feature; F->state = S_FAILED; F->W = w; F->H = h; F->pass = g_live++; dlssnr_call_last_create = 1; return F; }
+        bool large = presetLarge(preset); unsigned mw = 0, mh = 0; std::string dir = pickModelDir(w, h, large);
+        if (large && _stricmp(g_model.c_str(), "large") && !dir.empty() && !modelMatches(dir, true, true)) {   // preset 1 but no large-model data installed: the default model, as NVIDIA does for a missing preset
+            logf("create: preset %d asks for the large model (WEIGHTS_HT) but %s has no data for it; using the default model", preset, dir.c_str());
+            large = false; dir = pickModelDir(w, h, false); }
+        if (dir.empty() || !modelMatches(dir, large)) {   // unknown / missing nvngx_dlssnr.dll: a feature that only passes frames through (returns 1; OptiScaler ends NR on 0)
+            auto* F = new Feature; F->state = S_FAILED; F->W = w; F->H = h; dlssnr_call_last_create = 1; return F; }
         if (!readMeta(dir, &mw, &mh)) { seterr("create: no meta.txt in '%s' (run gen_runtime_data.py, see INSTALL.md)", dir.c_str()); return nullptr; }
         if ((mw != w || mh != h) && g_sync) { logf("create: frame %ux%u, model %ux%u - sync path resamples (universal for any resolution / upscaler mode)", w, h, mw, mh); w = mw; h = mh; }
         if (mw != w || mh != h) { seterr("create: model size %ux%u but data dir '%s' is for %ux%u - generate data for this size", w, h, dir.c_str(), mw, mh); return nullptr; }
-        auto* F = new Feature; F->dir = dir; F->pass = g_live++; setHost(F, intensity, style, localStructure, localTone, skinStructure, useAutoMask);   // ponytail: pass = live features at create (janblade creates the main one first); recreating only the main feature while extras live would mislabel it
-        if (F->pass) logf("create: extra pass %d (pass2_gain %.2f)", F->pass, g_pass2Gain); F->W = w; F->H = h; F->pitch = align256(w * 8);
+        auto* F = new Feature; F->dir = dir; setHost(F, intensity, style, localStructure, localTone, skinStructure, useAutoMask);
+        F->W = w; F->H = h; F->pitch = align256(w * 8);
         F->tin.resize((size_t)w * h * 8); F->tout.resize((size_t)w * h * 8);
         UINT64 sz = (UINT64)F->pitch * h;
         F->rb = makeBuffer(dev, D3D12_HEAP_TYPE_READBACK, sz, &F->rbp);
         F->up[0] = makeBuffer(dev, D3D12_HEAP_TYPE_UPLOAD, sz, &F->upp[0]); F->up[1] = makeBuffer(dev, D3D12_HEAP_TYPE_UPLOAD, sz, &F->upp[1]);
-        if (!F->rb || !F->up[0] || !F->up[1]) { seterr("create: cannot allocate staging buffers"); if (F->rb) F->rb->Release(); for (auto u : F->up) if (u) u->Release(); delete F; return nullptr; }
+        if (!F->rb || !F->up[0] || !F->up[1]) { seterr("create: cannot allocate staging buffers (device 0x%08lx)", (unsigned long)dev->GetDeviceRemovedReason()); if (F->rb) F->rb->Release(); for (auto u : F->up) if (u) u->Release(); delete F; return nullptr; }
         F->dev = dev;
         if (g_apply) {
             F->upOld[0] = makeBuffer(dev, D3D12_HEAP_TYPE_UPLOAD, sz, &F->upOldp[0]); F->upOld[1] = makeBuffer(dev, D3D12_HEAP_TYPE_UPLOAD, sz, &F->upOldp[1]);
@@ -799,24 +944,78 @@ __declspec(dllexport) void* dlssnr_call_create(const wchar_t* snippet, const wch
             if (F->upOld[0] && F->upOld[1] && F->zero) { memset(F->zerop, 0, (size_t)sz); F->delta = makeDelta(F); } else logf("delta: cannot allocate extra buffers, falling back to copy");
         }
         if (g_sync) F->sy = makeSync(F);
-        logf("create: sync %s; async fallback apply mode %s gain %.2f; compose %s detail %.2f", F->sy ? "resources ready" : "off", F->delta ? "delta (live frame + NR edit)" : "copy (stale NR image)", g_gain, g_compose == 1 ? "nv" : g_compose == 2 ? "ratio" : "add", g_detail);
+        logf("create: sync %s; async fallback apply mode %s gain %.2f; compose %s detail %.2f%s", F->sy ? "resources ready" : "off", F->delta ? "delta (live frame + NR edit)" : "copy (stale NR image)", g_gain, g_compose == 1 ? "nv" : g_compose == 2 ? "ratio" : "add", g_detail, g_dbg == 1 ? "; DEBUG_VIEW 1 (raw network output)" : g_dbg == 2 ? "; DEBUG_VIEW 2 (edit x4 + 0.5)" : "");
         { std::lock_guard<std::mutex> g(g_featMu); g_feats.push_back(F); }
         F->th = std::thread(worker, F);
         dlssnr_call_last_create = 1; return F;
     } catch (...) { seterr("create: exception"); return nullptr; }
 }
 
-// Pass-through: copy the live colour into the output (host contract: colour NON_PIXEL_SHADER_RESOURCE, output UNORDERED_ACCESS)
-// and report success. Returns 0 only when the formats differ (no plain copy possible).
+// Pass-through converter (colour and output formats differ, e.g. R11G11B10 -> RGBA16F, R9G9B9E5 -> RGBA16F): colour SRV -> output UAV,
+// the views convert. Process-global, rebuilt for another device. ponytail: one device at a time (a second live device alternating
+// with the first would rebuild it every call and free objects a list may still use); per-device objects if that ever happens.
+static const char* kPtHlsl = "Texture2D<float4> s : register(t0); RWTexture2D<float4> d : register(u0); cbuffer C : register(b0) { uint W; uint H; };\n"
+                             "[numthreads(8,8,1)] void main(uint3 id : SV_DispatchThreadID) { if (id.x < W && id.y < H) d[id.xy] = s[id.xy]; }\n";
+static struct { ID3D12Device* dev; ID3D12RootSignature* rs; ID3D12PipelineState* pso; ID3D12DescriptorHeap* heap; UINT incr, k; } g_pt;
+static std::mutex g_ptMu;
+static bool ptConvert(ID3D12GraphicsCommandList* cmd, ID3D12Resource* color, ID3D12Resource* out, DXGI_FORMAT cf, DXGI_FORMAT of, unsigned w, unsigned h) {
+    ID3D12Device* d = nullptr; if (FAILED(cmd->GetDevice(IID_PPV_ARGS(&d)))) return false; d->Release();   // the list keeps the device alive
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT a = {cf}, b = {of};
+    if (FAILED(d->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &a, sizeof a)) || !(a.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_LOAD) ||
+        FAILED(d->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &b, sizeof b)) || !(b.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) return false;
+    std::lock_guard<std::mutex> g(g_ptMu);
+    if (g_pt.dev != d) {
+        for (IUnknown* u : std::initializer_list<IUnknown*>{g_pt.rs, g_pt.pso, g_pt.heap}) if (u) u->Release();
+        g_pt = {}; g_pt.dev = d;   // a failed build stays failed for this device (no compile per frame)
+        typedef HRESULT (WINAPI *PFN_Compile)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*, UINT, UINT, ID3DBlob**, ID3DBlob**);
+        HMODULE c = LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32); auto comp = c ? (PFN_Compile)GetProcAddress(c, "D3DCompile") : nullptr;
+        ID3DBlob *cs = nullptr, *er = nullptr, *sb = nullptr;
+        D3D12_DESCRIPTOR_RANGE rg[2] = {}; rg[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; rg[0].NumDescriptors = 1; rg[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; rg[1].NumDescriptors = 1; rg[1].OffsetInDescriptorsFromTableStart = 1;
+        D3D12_ROOT_PARAMETER rp[2] = {}; rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; rp[0].DescriptorTable.NumDescriptorRanges = 2; rp[0].DescriptorTable.pDescriptorRanges = rg;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; rp[1].Constants.Num32BitValues = 2;
+        D3D12_ROOT_SIGNATURE_DESC rsd = {}; rsd.NumParameters = 2; rsd.pParameters = rp;
+        D3D12_DESCRIPTOR_HEAP_DESC hd = {}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 2 * 64; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        bool ok = comp && SUCCEEDED(comp(kPtHlsl, strlen(kPtHlsl), "nr_pass", nullptr, nullptr, "main", "cs_5_0", 0, 0, &cs, &er)) &&
+                  SUCCEEDED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sb, &er)) && SUCCEEDED(d->CreateRootSignature(0, sb->GetBufferPointer(), sb->GetBufferSize(), IID_PPV_ARGS(&g_pt.rs)));
+        if (ok) { D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {}; pd.pRootSignature = g_pt.rs; pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
+                  ok = SUCCEEDED(d->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_pt.pso))) && SUCCEEDED(d->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_pt.heap))); }
+        for (ID3DBlob* x : {cs, er, sb}) if (x) x->Release();
+        if (!ok) { logf("pass-through: converter shader setup failed"); if (g_pt.pso) g_pt.pso->Release(); g_pt.pso = nullptr; }
+        g_pt.incr = d->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+    if (!g_pt.pso || !g_pt.heap) return false;
+    const UINT k = (g_pt.k++ % 64) * 2;   // ring: a slot is reused 64 pass-throughs later (lists that old have completed)
+    auto cpu = g_pt.heap->GetCPUDescriptorHandleForHeapStart(); auto gpu = g_pt.heap->GetGPUDescriptorHandleForHeapStart(); cpu.ptr += (SIZE_T)k * g_pt.incr; gpu.ptr += (UINT64)k * g_pt.incr;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv = {}; sv.Format = cf; sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.Texture2D.MipLevels = 1;
+    d->CreateShaderResourceView(color, &sv, cpu); cpu.ptr += g_pt.incr;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uv = {}; uv.Format = of; uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; d->CreateUnorderedAccessView(out, nullptr, &uv, cpu);
+    ID3D12DescriptorHeap* hp[] = {g_pt.heap}; cmd->SetDescriptorHeaps(1, hp); cmd->SetComputeRootSignature(g_pt.rs); cmd->SetPipelineState(g_pt.pso);
+    cmd->SetComputeRootDescriptorTable(0, gpu); const UINT cb[2] = {w, h}; cmd->SetComputeRoot32BitConstants(1, 2, cb, 0);
+    cmd->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    D3D12_RESOURCE_BARRIER ub = {}; ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; ub.UAV.pResource = out; cmd->ResourceBarrier(1, &ub);
+    return true;
+}
+// Pass-through: the live colour into the output (host contract: colour NON_PIXEL_SHADER_RESOURCE, output UNORDERED_ACCESS), always 1
+// (OptiScaler ends NR for the session on 0). Same format: copy; else the converter above. An output without ALLOW_UNORDERED_ACCESS cannot be
+// in the UAV state, so its state is unknown and any barrier on it could remove the device: it is left untouched (logged once).
 static int passThrough(ID3D12GraphicsCommandList* cmd, ID3D12Resource* color, ID3D12Resource* out, unsigned w, unsigned h) {
+    static std::atomic<bool> wUav{false}, wFmt{false}, wSize{false};
     D3D12_RESOURCE_DESC cd = color->GetDesc(), od = out->GetDesc();
-    if (cd.Format != od.Format || cd.Width < w || cd.Height < h || od.Width < w || od.Height < h) return 0;
+    const unsigned cw = (unsigned)(std::min)({(UINT64)w, cd.Width, od.Width}), ch = (std::min)({h, cd.Height, od.Height});
+    if ((cw != w || ch != h) && !wSize.exchange(true)) logf("pass-through: %ux%u asked, colour %llux%u, output %llux%u - copying %ux%u", w, h, cd.Width, cd.Height, od.Width, od.Height, cw, ch);
+    if (!(od.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+        if (!wUav.exchange(true)) logf("pass-through: output (format %d) has no ALLOW_UNORDERED_ACCESS flag, its state is unknown - left untouched (the host shows its own content)", (int)od.Format);
+        return 1; }
+    if (!cw || !ch) return 1;
+    if (cd.Format != od.Format) {
+        if (!ptConvert(cmd, color, out, cd.Format, od.Format, cw, ch) && !wFmt.exchange(true)) logf("pass-through: colour format %d cannot be converted to output format %d on this GPU - output left untouched", (int)cd.Format, (int)od.Format);
+        return 1; }
     D3D12_RESOURCE_BARRIER b[2] = {}; for (auto& x : b) { x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; x.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; }
     b[0].Transition.pResource = color; b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b[1].Transition.pResource = out; b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     cmd->ResourceBarrier(2, b);
     D3D12_TEXTURE_COPY_LOCATION dl = {}, sl = {}; dl.pResource = out; dl.Type = sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.pResource = color;
-    D3D12_BOX bx = {0, 0, 0, w, h, 1}; cmd->CopyTextureRegion(&dl, 0, 0, 0, &sl, &bx);
+    D3D12_BOX bx = {0, 0, 0, cw, ch, 1}; cmd->CopyTextureRegion(&dl, 0, 0, 0, &sl, &bx);
     for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
     cmd->ResourceBarrier(2, b);
     return 1;
@@ -828,34 +1027,44 @@ __declspec(dllexport) int dlssnr_call_evaluate_v2(ID3D12GraphicsCommandList* cmd
     try {
         auto* F = (Feature*)f; int n = ++g_evalCalls;
         if (!F || !cmd || !color || !out) return 0;
+        passOrder(F, cmd);
         if (F->state == S_FAILED) return passThrough(cmd, color, out, w, h);   // NR off for this session (model guard, runtime failure): native frame
         setHost(F, intensity, style, localStructure, localTone, skinStructure, useAutoMask);
-        std::lock_guard<std::mutex> lk(F->mu); F->lastUse = GetTickCount(); F->evaluated = true;
-        if (F->state == S_SYNC) applyCond(F);   // the runtime applies it at the start of the next network run
-        if ((w != F->W || h != F->H) && F->state != S_SYNC) { if (!F->warnedSize) { F->warnedSize = true; logf("evaluate: frame %ux%u, model %ux%u - native frame until the runtime has loaded", w, h, F->W, F->H); } return passThrough(cmd, color, out, w, h); }
+        if (const int d = g_testEvalDelay) for (const DWORD t0 = GetTickCount(); g_testEvalDelay && GetTickCount() - t0 < (DWORD)d;) Sleep(5);   // test hook: hold until released (dlssnr_port_test(0)) or d ms
+        std::lock_guard<std::mutex> lk(F->mu);
+        if (F->state == S_FAILED) { logf("evaluate %p: freed (evicted) while this evaluate waited for it - native frame", f); return passThrough(cmd, color, out, w, h); }   // evicted between the check above and the lock (evictIdle frees everything under F->mu)
+        F->lastUse = GetTickCount(); F->evaluated = true;
+        const int fs = F->state;   // one snapshot: the worker may switch loading -> sync/failed while we record
+        if (fs == S_SYNC) applyCond(F);   // the runtime applies it at the start of the next network run
+        if ((w != F->W || h != F->H) && fs != S_SYNC) { if (!F->warnedSize) { F->warnedSize = true; logf("evaluate: frame %ux%u, model %ux%u - native frame until the runtime has loaded", w, h, F->W, F->H); } return passThrough(cmd, color, out, w, h); }
         D3D12_RESOURCE_DESC cd = color->GetDesc(), od = out->GetDesc();
         // R9G9B9E5 output (RE Engine): sync path only, packed in a shader and copied in. Only when the host created the texture
         // with ALLOW_UNORDERED_ACCESS: then it is in the UAV state (OptiScaler-DLSSNR contract) and our UAV<->COPY_DEST barriers
         // are legal. Without the flag a UAV-state barrier removes the device, so that case stays native.
-        const bool e5 = F->state == S_SYNC && od.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && (od.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-        if (F->state == S_SYNC && od.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && !e5) {
-            if (!F->warnedFmt) { F->warnedFmt = true; logf("evaluate: R9G9B9E5 output without UAV flag (%llux%u) - native frame; try NR before super resolution", od.Width, od.Height); } return 0; }
-        if (!(fmtOk(cd.Format) || (F->state == S_SYNC && cd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) || !(fmtOk(od.Format) || e5) || cd.Width < w || cd.Height < h || od.Width < w || od.Height < h) {
-            if (!F->warnedFmt) { F->warnedFmt = true; logf("evaluate: unsupported color/output format %d/%d (%llux%u / %llux%u) - only RGBA16F / R11G11B10_FLOAT / RGBA8_UNORM", (int)cd.Format, (int)od.Format, cd.Width, cd.Height, od.Width, od.Height); } return 0; }
+        // Format / size conditions never return 0 (OptiScaler ends NR for the session on 0): pass-through, which converts formats.
+        const bool e5 = fs == S_SYNC && od.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && (od.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        if (od.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && !(od.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+            if (!F->warnedFmt) { F->warnedFmt = true; logf("evaluate: R9G9B9E5 output without UAV flag (%llux%u) - native frame; try NR before super resolution", od.Width, od.Height); } return passThrough(cmd, color, out, w, h); }
+        if (!(od.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return passThrough(cmd, color, out, w, h);   // no UAV on it: logged there
+        if (!(fmtOk(cd.Format) || (fs == S_SYNC && cd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) || !(fmtOk(od.Format) || e5) || cd.Width < w || cd.Height < h || od.Width < w || od.Height < h) {
+            if (!F->warnedFmt) { F->warnedFmt = true; logf("evaluate: unsupported color/output format %d/%d (%llux%u / %llux%u)%s - native frame; NR takes RGBA16F / R11G11B10_FLOAT / RGBA8_UNORM (R9G9B9E5 once loaded)", (int)cd.Format, (int)od.Format, cd.Width, cd.Height, od.Width, od.Height, fs == S_SYNC ? "" : " while loading"); }
+            return passThrough(cmd, color, out, w, h); }
         F->inFmt = (int)cd.Format; F->outFmt = (int)od.Format;
         if (reset == 1) { F->published = -1; F->resetGen++; }      // a real reset (first frame, resolution change, camera cut): no edit from before it survives. Only exactly 1 counts.
-        if (n <= 3) logf("evaluate #%d state %d published %d", n, F->state.load(), F->published.load());
+        if (n <= 3) logf("evaluate #%d state %d published %d", n, fs, F->published.load());
 
-        if (F->state == S_SYNC) {                                   // same-frame path: everything below runs on the GPU in the host's list order
+        if (fs == S_SYNC) {                                   // same-frame path: everything below runs on the GPU in the host's list order
             Sync* s = F->sy; ID3D12GraphicsCommandList2* c2 = nullptr;
             if (FAILED(cmd->QueryInterface(IID_PPV_ARGS(&c2)))) { if (!s->busy++) logf("sync: host list has no WriteBufferImmediate (ID3D12GraphicsCommandList2) - native frame"); return passThrough(cmd, color, out, w, h); }
             c2->Release();                                          // the host holds the list; we only need the interface for this call
-            if (reset == 1) { s->minSeq = s->seq + 1; s->part = 0; }  // fg/split: no edit from before a camera cut is reused; split: a half-done job is abandoned
+            if (reset == 1) { s->minSeq = s->seq + 1; s->part = 0; s->fadeK = 0; }  // fg/split: no edit from before a camera cut is reused; split: a half-done job is abandoned
             const bool sp = s->split;
             const unsigned seq = s->seq + 1; ++s->frm; const unsigned accF0 = s->accFrm, accT0 = s->accTo; const unsigned age = s->frm - s->lastNrFrm; const unsigned chain = reset != 1 && (age == 1 || (age <= 8 && s->accFrm + 1 == s->frm)) ? age : 0, histOk = s->histOn ? chain : 0;   // frames since the last NR output; > 1 needs an unbroken offset chain (acc) over the in-between frames
             const bool reuseOn = true;   // cap the edit on every NR frame: busy frames (and spin timeouts) reuse it   // cap the edit on NR frames, reuse it on the others
             const bool skip = g_nrEvery > 1 && reset != 1 && s->sinceNr + 1 < (unsigned)g_nrEvery && (int)(s->seq - s->minSeq) >= 0;   // nr_every: reuse frame (an edit since the last reset exists)
-            auto enq = [&] { return sp ? p_extEnqueue3(F->ctx, seq, g_maxInflight, s->part == 0 && histOk ? g_hist : 0, (int)s->part + 1) : skip ? 1 : (s->histOn ? p_extEnqueue2(F->ctx, seq, g_maxInflight, histOk ? g_hist : 0) : p_extEnqueue(F->ctx, seq, g_maxInflight)); };   // HIP: wait flag_in >= seq, run, flag_out = seq (queued now, runs when the list below executes)
+            // nr_split + halo_fix: history older than one frame goes to the post-block lerp only (hist_valid 2). In the pre-block input lanes the
+            // N-frame-old warped history made the network draw ghost copies of thin moving objects (FO4 dump: 540p HOLE 14 % -> 1.2 %).
+            auto enq = [&] { return sp ? p_extEnqueue3(F->ctx, seq, g_maxInflight, s->part == 0 && histOk ? (g_fill && g_hist == 1 && histOk > 1 ? 2 : g_hist) : 0, (int)s->part + 1) : skip ? 1 : (s->histOn ? p_extEnqueue2(F->ctx, seq, g_maxInflight, histOk ? g_hist : 0) : p_extEnqueue(F->ctx, seq, g_maxInflight)); };   // HIP: wait flag_in >= seq, run, flag_out = seq (queued now, runs when the list below executes)
             int q = enq();
             // busy_mode=wait: HIP slots free up when the ext thread finishes a job of an EARLIER, already submitted list (or drops it after its own 500 ms
             // flag_in bound), never through the list we are recording -> a bounded CPU wait cannot deadlock. It throttles the game to the network rate.
@@ -863,11 +1072,12 @@ __declspec(dllexport) int dlssnr_call_evaluate_v2(ID3D12GraphicsCommandList* cmd
                 while (q == 1 && GetTickCount() - t0 < (DWORD)g_busyWaitMs) { Sleep(0); q = enq(); }   // ponytail: yield-spin (one core for up to ~1 frame), an event from the runtime if CPU use matters
                 if (q == 1 && ++s->waitFails == 8) logf("sync: busy_wait_ms %d ran out 8 times (host submits late?) - busy_mode reuse from now on", g_busyWaitMs);
                 else if (q == 0) s->waitFails = 0; }
-            if (q < 0) { seterr("nr_ext_enqueue failed (%d)", q); F->state = S_FAILED; return 0; }
+            if (q < 0) { seterr("nr_ext_enqueue failed (%d)", q); F->state = S_FAILED; return passThrough(cmd, color, out, w, h); }   // -2: the runtime's self-check failed; native frames from now on
             s->sinceNr = q == 0 ? 0 : s->sinceNr + 1;
             const bool haveNr = (int)(s->seq - s->minSeq) >= 0;   // an NR edit since the last reset exists to reuse
             if (q != 0 && !g_fg && !skip && !sp && !haveNr) { if (s->busy++ < 5 || s->busy % 100 == 0) logf("sync: frame not queued (HIP still busy with older frames, %u so far) - native frame", s->busy); return passThrough(cmd, color, out, w, h); }
             if (q == 0) s->seq = seq;
+            if (q == 0 && sp && s->part == 0) s->jobSeq = seq;   // spin: later parts of this job are skipped if its part 1 did not finish
             if (q == 0 && !(sp && s->part != 0)) { s->frmOf[seq % 16] = s->frm; if (++s->ran <= 3 || s->ran % 1000 == 0) logf("sync: NR frame %u queued (frame %ux%u, %u native, %u reused so far)", s->ran, w, h, s->busy, s->reused); }
             else s->reused++;                                       // fg: HIP busy / nr_every: in-between frame -> live frame + last NR edit, the queue does not wait
             UINT k = (++s->rec % kSyncRing) * 4; auto cpu = s->heap->GetCPUDescriptorHandleForHeapStart(); auto gpu = s->heap->GetGPUDescriptorHandleForHeapStart();
@@ -881,10 +1091,13 @@ __declspec(dllexport) int dlssnr_call_evaluate_v2(ID3D12GraphicsCommandList* cmd
                 case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_UNORM;
                 case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT; case DXGI_FORMAT_R32G32_TYPELESS: return DXGI_FORMAT_R32G32_FLOAT; default: return f; } };
             const DXGI_FORMAT mf = motion ? srvFmt(motion->GetDesc().Format) : DXGI_FORMAT_UNKNOWN, df = depth ? srvFmt(depth->GetDesc().Format) : DXGI_FORMAT_UNKNOWN;
-            const bool mvOk = motion && mf != DXGI_FORMAT_UNKNOWN && mW && mH && mvSx == mvSx && mvSy == mvSy, mvOn = (g_mv || sp) && mvOk, hMv = (s->histOn || sp) && mvOk, dOn = (mvOn || hMv) && depth && df != DXGI_FORMAT_UNKNOWN && dW && dH;
+            const bool mvOk = motion && mf != DXGI_FORMAT_UNKNOWN && mW && mH && mvSx == mvSx && mvSy == mvSy, mvOn = (g_mv || sp) && mvOk, hMv = (s->histOn || sp) && mvOk;
+            const bool gMv = s->mvOff && mvOk, mvBound = mvOk && (mvOn || hMv || gMv || (s->tea && s->teb)), dOn = mvBound && depth && df != DXGI_FORMAT_UNKNOWN && dW && dH;   // edit stabilisation needs the vectors (and depth) on its own too
+            if (s->tea && g_eT > 0.f && !mvOk && !s->warnedTe) { s->warnedTe = true; logf("edit_temporal: no usable motion vectors from the host (motion %p %ux%u) - no temporal blend (edit_limit still applies)", (void*)motion, mW, mH); }
+            if (s->tea && !sp && w == F->W && h == F->H && !s->warnedTe) { s->warnedTe = true; logf("edit_temporal / edit_limit: frame %ux%u is the model size and nr_split=0 - not applied on this path", w, h); }
             if (s->histOn && !mvOk && !s->warnedMv) { s->warnedMv = true; logf("history: no usable motion vectors from the host (motion %p %ux%u) - history unwarped (gates only)", (void*)motion, mW, mH); }
             if (g_mv && !mvOn && !s->warnedMv) { s->warnedMv = true; logf("mv_reuse: no usable motion vectors from the host (motion %p %ux%u) - plain reuse", (void*)motion, mW, mH); }
-            sv.Format = mvOn || hMv ? mf : DXGI_FORMAT_R16G16_FLOAT; F->dev->CreateShaderResourceView(mvOn || hMv ? motion : nullptr, &sv, at(1));
+            sv.Format = mvBound ? mf : DXGI_FORMAT_R16G16_FLOAT; F->dev->CreateShaderResourceView(mvBound ? motion : nullptr, &sv, at(1));
             sv.Format = dOn ? df : DXGI_FORMAT_R32_FLOAT; F->dev->CreateShaderResourceView(dOn ? depth : nullptr, &sv, at(2));
             D3D12_UNORDERED_ACCESS_VIEW_DESC uv = {}; uv.Format = e5 ? DXGI_FORMAT_R16G16B16A16_FLOAT : od.Format; uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; F->dev->CreateUnorderedAccessView(e5 ? nullptr : out, nullptr, &uv, at(3));   // e5: null UAV, output goes through ob
             UINT cb[kCb] = { F->W, F->H, seq, (UINT)(g_fg ? g_fgWaitMs : g_spinMs) * 6000u /* ~0.16 us per poll on a 6900 XT */, (UINT)s->outOff, (UINT)s->flagOff, 0, w | (h << 16), reuseOn ? s->minSeq : 0u, 0, 0, (UINT)g_gate, s->frm,
@@ -893,24 +1106,32 @@ __declspec(dllexport) int dlssnr_call_evaluate_v2(ID3D12GraphicsCommandList* cmd
             cb[33] = g_hdr == 1 ? 1u : g_hdr == 2 && (cd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || cd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) ? 2u | ((UINT)(g_hdrFrac * F->W * F->H) << 2) : 0u;   // hdrM | auto threshold << 2
             if (!F->pass) g_hdrP0 = cb[33] & 3; else if (g_hdr == 2) cb[33] = g_hdrP0 == 2 ? 3u : g_hdrP0;   // extra pass: its input is pass 0's output after the host's ClampProxy (saturated to [0,1]), it cannot detect HDR itself -> pass 0's decision (3 = follow hl)
             { const float hk = F->pass ? g_pass2Gain : 1.f, hx = F->pass ? 1.f : g_hdrExp * g_hdrBias, hkb = g_hdrKey * g_hdrBias; memcpy(&cb[34], &hk, 4); memcpy(&cb[35], &hx, 4); memcpy(&cb[36], &hkb, 4); memcpy(&cb[37], &g_hdrAdapt, 4); cb[39] = (UINT)g_compose; memcpy(&cb[40], &g_detail, 4); }   // extra pass: E = 1 (its input is ClampProxy's unit cube, not scene-linear; pass 0's E would squeeze it to T(E) ~ 0.25, near black)
-            const float I = curIntensity(F), amp = I > 1.f ? I : 0.f; memcpy(&cb[38], &amp, 4);   // intensity > 1: the blend stays at 1, put() applies the reference's ratio compose (boost)
+            const float I = curIntensity(F), amp = I > 1.f ? (g_iRatio ? -I : I) : 0.f; memcpy(&cb[38], &amp, 4);   // intensity > 1: the blend stays at 1, put() applies the reference's ratio compose (boost)
             float gain = (F->pass ? g_gain * g_pass2Gain : g_gain) * (std::min)(I, 1.f); memcpy(&cb[6], &gain, 4); memcpy(&cb[9], &g_gateLo, 4); memcpy(&cb[10], &g_gateHi, 4);   // gLo, gHi   // gain x intensity: NVIDIA's blend towards the NR result (up to 1; compose nv/ratio get it as their g)
+            if (!s->mvLogged && (mvOn || hMv)) { s->mvLogged = true; logf("motion: %ux%u fmt %d base %u,%u, host scale %g x %g (motion subrect px), x %g x %g to frame px, mv_scale %g (previous = current + mv * scale, frame px)", mW, mH, (int)mf, mBx, mBy, mvSx, mvSy, mW ? (double)w / mW : 1.0, mH ? (double)h / mH : 1.0, g_mvK); }
+            if (mW && mH) { mvSx *= (float)w / mW; mvSy *= (float)h / mH; }   // raw x host scale = px of the motion subrect (NGX MV_Scale, janblade's MvScale); the shaders want px of this w x h frame (Cyberpunk: vectors at render res 1707x960 under a 2560x1440 frame moved every warp 2/3 of the way)
+            mvSx *= g_mvK; mvSy *= g_mvK;   // mv_scale: calibration knob for a host whose vectors are off (-1 = flipped, 2 = half-length); 1 = as the host says
             memcpy(&cb[15], &mvSx, 4); memcpy(&cb[16], &mvSy, 4); memcpy(&cb[22], &g_mvLo, 4); memcpy(&cb[23], &g_mvHi, 4); memcpy(&cb[28], &g_hLo, 4); memcpy(&cb[29], &g_hHi, 4);
             const bool teOn = s->tea && s->teb && (sp || w != F->W || h != F->H); memcpy(&cb[41], &g_eT, 4); memcpy(&cb[42], &g_eL, 4);   // edit stabilisation: split or resampled full-NR path
-            cb[43] = teOn ? 1u | (UINT)g_eFl | (s->teFrm + 1 == s->frm && reset != 1 ? 8u : 0u) : 0u;
+            memcpy(&cb[44], &g_tS, 4); memcpy(&cb[45], &g_cS, 4); memcpy(&cb[46], &g_pw, 4);
+            cb[43] = teOn ? 1u | (UINT)g_eFl | (s->teFrm + 1 == s->frm && reset != 1 ? 8u : 0u) | (mvBound ? 16u : 0u) : 0u; cb[47] = sp ? s->jobSeq : 0u; cb[48] = (UINT)g_dbg; cb[52] = gMv ? (UINT)s->mvOff : 0u; cb[53] = s->mvG;   // vit_motion_gate cells (no vectors this frame: no tag, the runtime reuses plainly)
+            if (g_hCR) cb[43] |= 64u; if (g_hZp) cb[43] |= 128u; if (g_fill) cb[43] |= 256u; if (g_fill && sp) cb[43] |= 512u; if (g_fill && g_fallback) cb[43] |= 1024u;   // history_filter=catmull, history_pad=zero (hwp); bits 1/4/8/16 are edit stabilisation
+            if (!g_hGate) { const float big[2] = {1e30f, 2e30f}; memcpy(&cb[28], big, 8); }   // history_gate=0 (NVIDIA): no colour gate
+            { const float sy = F->appliedCond[0], sT = F->appliedCond[1]; cb[49] = sy == 1.f || sy == 2.f ? (UINT)sy : 0u; memcpy(&cb[50], &sT, 4); }   // style grade (sty) with the conditioning the runtime got
             ID3D12DescriptorHeap* hp[] = { s->heap }; cmd->SetDescriptorHeaps(1, hp); cmd->SetComputeRootSignature(s->rs);
             cmd->SetComputeRootDescriptorTable(0, gpu); cmd->SetComputeRootUnorderedAccessView(1, s->io->GetGPUVirtualAddress()); cmd->SetComputeRootUnorderedAccessView(2, s->st->GetGPUVirtualAddress());
-            if (!g_hl) g_hl = sharedBuffer(F->dev, 65536, D3D12_HEAP_FLAG_NONE, nullptr);   // ponytail: one process-global latch, never freed; one device assumed
+            if (g_hlDev != F->dev) { if (g_hl) g_hl->Release(); if (g_eRb) g_eRb->Release(); g_hl = g_eRb = nullptr; g_eRbp = nullptr; g_hlDev = F->dev; }   // a new device (the host recreated it): latch + its readback belong to the old one
+            if (!g_hl) g_hl = sharedBuffer(F->dev, 65536, D3D12_HEAP_FLAG_NONE, nullptr);   // ponytail: one process-global latch for the current device; two live devices alternating would recreate it per call
             cmd->SetComputeRootUnorderedAccessView(5, (g_hl ? g_hl : s->st)->GetGPUVirtualAddress());
             cmd->SetComputeRootUnorderedAccessView(4, s->st->GetGPUVirtualAddress());   // ob slot: unused unless e5; bound so the root signature is complete
             D3D12_RESOURCE_BARRIER uav = {}; uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;   // null resource = all UAV writes
             if (!F->pass && (cb[33] & 3)) { cmd->SetComputeRoot32BitConstants(3, kCb, cb, 0); cmd->SetPipelineState(s->lat); cmd->Dispatch(1, 1, 1); cmd->ResourceBarrier(1, &uav);   // hdr: latch + exposure (from last frame's meter) before anything reads them
-                static DWORD eT = 0; static ID3D12Resource* eRb = nullptr; static uint8_t* eRbp = nullptr; const DWORD now = GetTickCount();
-                if (g_hl && now - eT >= 1000) {   // ~1/s: log the previous copy (landed long ago), queue a new one of hl[0..8]   // ponytail: process-global, never freed
-                    if (eRb) { uint32_t v[2]; memcpy(v, eRbp, 8); float e; memcpy(&e, &v[1], 4); logf("hdr: latched %u, exposure E %.4f (scene mean L ~%.3g)", v[0], e, e > 0 ? g_hdrKey * g_hdrBias / e : 0.0); }
-                    else eRb = makeBuffer(F->dev, D3D12_HEAP_TYPE_READBACK, 256, &eRbp);
-                    if (eRb) { D3D12_RESOURCE_BARRIER t = {}; t.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; t.Transition.pResource = g_hl; t.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; t.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-                               cmd->ResourceBarrier(1, &t); cmd->CopyBufferRegion(eRb, 0, g_hl, 0, 8); std::swap(t.Transition.StateBefore, t.Transition.StateAfter); cmd->ResourceBarrier(1, &t); }
+                static DWORD eT = 0; const DWORD now = GetTickCount();
+                if (g_hl && now - eT >= 1000) {   // ~1/s: log the previous copy (landed long ago), queue a new one of hl[0..8]   // ponytail: process-global (with g_hl, per device)
+                    if (g_eRb) { uint32_t v[2]; memcpy(v, g_eRbp, 8); float e; memcpy(&e, &v[1], 4); logf("hdr: latched %u, exposure E %.4f (scene mean L ~%.3g)", v[0], e, e > 0 ? g_hdrKey * g_hdrBias / e : 0.0); }
+                    else g_eRb = makeBuffer(F->dev, D3D12_HEAP_TYPE_READBACK, 256, &g_eRbp);
+                    if (g_eRb) { D3D12_RESOURCE_BARRIER t = {}; t.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; t.Transition.pResource = g_hl; t.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; t.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                               cmd->ResourceBarrier(1, &t); cmd->CopyBufferRegion(g_eRb, 0, g_hl, 0, 8); std::swap(t.Transition.StateBefore, t.Transition.StateAfter); cmd->ResourceBarrier(1, &t); }
                     eT = now; } }   // hdr auto: latch before anything reads it
             auto tr = [&](D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) { D3D12_RESOURCE_BARRIER t = {}; t.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; t.Transition.pResource = s->sig; t.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; t.Transition.StateBefore = a; t.Transition.StateAfter = b; cmd->ResourceBarrier(1, &t); };
             auto release = [&] { tr(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);   // input is in io (or: frame N+1 began): release the HIP stream's flag_in wait
@@ -929,7 +1150,7 @@ __declspec(dllexport) int dlssnr_call_evaluate_v2(ID3D12GraphicsCommandList* cmd
                     accP();
                     if (q == 0) { release(); pass(s->spin, 1, 1);
                                   if (++s->part == s->np) { cb[12] = s->jobFrm;   // last part done -> keep its P / edit, stamped with the job's own frame
-                                      if (s->histOn) pass(s->hst, gx, gy); pass(s->cap, gx, gy); cb[12] = s->frm; s->doneFrm = s->jobFrm; s->part = 0; } }
+                                      if (s->histOn) pass(s->hst, gx, gy); pass(s->cap, gx, gy); cb[12] = s->frm; s->doneFrm = s->jobFrm; s->part = 0; s->fadeK = 0; } }
                 }
                 // offsets from this frame to the shown edit's frame T: vectors to frame-1, then acc of frame-1 (-> accT0) and/or the anchor (ancFrm -> ancTo)
                 const unsigned da = s->frm - s->doneFrm, T = s->doneFrm; const bool accOk = accF0 + 1 == s->frm, ancOk = s->np > 2 && s->ancTo == T;
@@ -937,6 +1158,7 @@ __declspec(dllexport) int dlssnr_call_evaluate_v2(ID3D12GraphicsCommandList* cmd
                 cb[32] = 1 | fl | ((da < 0x8000000u ? da : 0u) << 4);
                 if (T != 0xFFFFFFF0u && da < 64) { s->ageSum += da; s->ageCnt++; s->ageMax = (std::max)(s->ageMax, da); s->loose += fl == 8; }
                 if (s->ageCnt == 200) { logf("nr_split: edit age mean %.2f max %u frames, %u of 200 frames vectors-only", s->ageSum / 200.0, s->ageMax, s->loose); s->ageSum = s->ageCnt = s->ageMax = s->loose = 0; }
+                { const unsigned k = ++s->fadeK; const float fw = k < (unsigned)g_fade ? (float)(g_fade - k) / (g_fade - k + 1) : 0.f; memcpy(&cb[51], &fw, 4); }   // split_fade: frame k (1 = the job landed) shows k/N of the new edit
                 if (teOn) { pass(s->tea, gx, gy); pass(s->teb, gx, gy); s->teFrm = s->frm; }
                 cmd->SetComputeRoot32BitConstants(3, kCb, cb, 0);
             } else {
@@ -958,18 +1180,20 @@ __declspec(dllexport) int dlssnr_call_evaluate_v2(ID3D12GraphicsCommandList* cmd
                 cmd->SetPipelineState(s->spin); cmd->Dispatch(1, 1, 1); cmd->ResourceBarrier(1, &uav);   // wait (bounded) for the HIP stream's flag_out = seq
                 if (s->histOn) { cmd->SetPipelineState(s->hst); cmd->Dispatch((F->W + 7) / 8, (F->H + 7) / 8, 1); cmd->ResourceBarrier(1, &uav); }   // keep this output for the next frame's history
                 if (reuseOn) { cmd->SetPipelineState(s->cap); cmd->Dispatch((F->W + 7) / 8, (F->H + 7) / 8, 1); cmd->ResourceBarrier(1, &uav); }   // keep the edit (+ input, depth) for the reuse frames
-                if (teOn) { for (auto* p : {s->tea, s->teb}) { cmd->SetPipelineState(p); cmd->Dispatch((F->W + 7) / 8, (F->H + 7) / 8, 1); cmd->ResourceBarrier(1, &uav); } s->teFrm = s->frm; }
             }
+            if (teOn) { for (auto* p : {s->tea, s->teb}) { cmd->SetPipelineState(p); cmd->Dispatch((F->W + 7) / 8, (F->H + 7) / 8, 1); cmd->ResourceBarrier(1, &uav); } s->teFrm = s->frm; }   // NR and reuse frames: the stabilised edit keeps its chain
             }
             if (e5) {                                               // R9G9B9E5 has no typed UAV store: pack into a buffer, copy into the texture
                 const UINT pitch = (w * 4 + 255) & ~255u;
-                if (!s->ob || s->obW != w || s->obH != h) {
-                    if (s->ob) s->ob->Release(); s->ob = nullptr; D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
+                for (size_t i = 0; i < s->obOld.size();)   // replaced staging buffers: free once no list in flight can use them
+                    if (s->frm - s->obOld[i].second > (unsigned)g_maxInflight + 2) { s->obOld[i].first->Release(); s->obOld.erase(s->obOld.begin() + i); } else i++;
+                if (!s->ob || (UINT64)pitch * h > s->obCap) {   // grow only; the old one may still be read by an earlier list
+                    if (s->ob) s->obOld.push_back({s->ob, s->frm}); s->ob = nullptr; s->obCap = 0; D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
                     D3D12_RESOURCE_DESC bd = {}; bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)pitch * h; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
                     bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
                     HRESULT hr = F->dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&s->ob));
                     if (FAILED(hr)) { s->ob = nullptr; logf("sync: R9G9B9E5 staging buffer failed (0x%08lx) - native frame", (unsigned long)hr); return passThrough(cmd, color, out, w, h); }
-                    s->obW = w; s->obH = h; logf("sync: output is R9G9B9E5 - packed in a shader and copied (%ux%u)", w, h);
+                    s->obCap = bd.Width; logf("sync: output is R9G9B9E5 - packed in a shader and copied (%ux%u)", w, h);
                 }
                 cmd->SetComputeRootUnorderedAccessView(4, s->ob->GetGPUVirtualAddress());
                 cmd->SetPipelineState(s->expPk); cmd->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
@@ -986,6 +1210,14 @@ __declspec(dllexport) int dlssnr_call_evaluate_v2(ID3D12GraphicsCommandList* cmd
             }
             cmd->SetComputeRootUnorderedAccessView(4, s->st->GetGPUVirtualAddress());   // unused by exp; bound so the root signature is complete
             cmd->SetPipelineState(s->exp); cmd->Dispatch((w + 7) / 8, (h + 7) / 8, 1); cmd->ResourceBarrier(1, &uav);
+            if (g_dumpFrame && !F->pass) { std::lock_guard<std::mutex> dg(g_dumpMu);   // dump_frame: queue the copies on frame N, write them 10 frames later (that list has run by then)
+                if (s->frm - g_dumpFrame < g_dumpFrames) { const auto st = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    const std::string sf = g_dumpFrames > 1 ? "_f" + std::to_string(s->frm - g_dumpFrame) : "";   // dump_frames > 1: colour_f0, colour_f1, ...
+                    dumpQueue(F->dev, cmd, color, st, w, h, ("colour" + sf).c_str(), g_dumpItems); dumpQueue(F->dev, cmd, depth, st, dW, dH, ("depth" + sf).c_str(), g_dumpItems);
+                    dumpQueue(F->dev, cmd, motion, st, mW, mH, ("motion" + sf).c_str(), g_dumpItems); dumpQueue(F->dev, cmd, out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, w, h, ("output" + sf).c_str(), g_dumpItems);
+                    logf("dump_frame: frame %u queued (%zu resources; intensity %.2f style %d tone %.2f structure %.2f skin %.2f mask %d)", s->frm, g_dumpItems.size(), curIntensity(F), F->hostStyle.load(), F->hostTone.load(), F->hostStruct.load(), F->hostSkin.load(), F->hostMask.load()); }
+                else if (s->frm == g_dumpFrame + g_dumpFrames + 9 && !g_dumpItems.empty()) { const std::string lp = (g_logName.size() > 1 && g_logName[1] == ':') ? g_logName : narrow(g_dir) + g_logName;
+                    logf("dump_frame: written%s", dumpWrite(lp.substr(0, lp.find_last_of("\\/") + 1), g_dumpItems).c_str()); } }
             return 1;
         }
 
@@ -1029,6 +1261,18 @@ __declspec(dllexport) int dlssnr_call_evaluate_v2(ID3D12GraphicsCommandList* cmd
         return 1;
     } catch (...) { return 0; }
 }
+// v1 (older janblade forwarder, AMDNR's NVIDIA path): depth and motion share one extent guideW x guideH at (0,0).
+__declspec(dllexport) int dlssnr_call_evaluate(ID3D12GraphicsCommandList* cmd, void* f, void* params, ID3D12Resource* color, ID3D12Resource* depth,
+        ID3D12Resource* motion, ID3D12Resource* out, unsigned w, unsigned h, unsigned gW, unsigned gH,
+        int depthInv, int reset, float intensity, int style, float localStructure, float localTone, float skinStructure, int useAutoMask, float mvSx, float mvSy) {
+    return dlssnr_call_evaluate_v2(cmd, f, params, color, depth, motion, out, w, h, gW, gH, gW, gH, 0, 0, 0, 0,
+                                   depthInv, reset, intensity, style, localStructure, localTone, skinStructure, useAutoMask, mvSx, mvSy);
+}
+// NR does not upscale: every quality level runs at the output size (ratio 1.0).
+__declspec(dllexport) int dlssnr_query_scaling_ratio(const wchar_t*, void*, unsigned, float* outRatio) {
+    dlssnr_last_ratio_stage = 0; if (!outRatio) return 0;
+    *outRatio = 1.f; dlssnr_last_ratio_result = 1; dlssnr_last_ratio_stage = 5; return 1;
+}
 
 }   // extern "C"
 // Runtime context + every D3D12 resource of F. Callers: release, the worker (released while loading), eviction (keepF).
@@ -1061,7 +1305,7 @@ extern "C" {
 __declspec(dllexport) void dlssnr_call_release(void* f) {
     auto* F = (Feature*)f; if (!F) return;
     try {
-        logf("release %p", f); F->quit = true; g_live--;
+        logf("release %p", f); F->quit = true; passForget(F);
         { std::lock_guard<std::mutex> g(g_featMu); g_feats.erase(std::remove(g_feats.begin(), g_feats.end(), F), g_feats.end()); }
         if (g_exiting) { if (F->th.joinable()) F->th.detach(); return; }   // process exit: never block, leak F
         if (F->state == S_LOADING) { if (F->th.joinable()) F->th.detach(); if (F->done.exchange(true)) freeFeature(F); return; }   // still loading: never block the game, the worker frees F when nr_create returns

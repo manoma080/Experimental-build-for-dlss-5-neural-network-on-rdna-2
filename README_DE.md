@@ -15,6 +15,13 @@ Diese Mod bringt es auf **AMD-Radeon-RX-6000-Karten** (RDNA2).
 > **Experimentell.** Kann abstürzen, falsch aussehen oder viele FPS kosten. Nicht in Online-Spielen
 > mit Anti-Cheat benutzen.
 
+**Neu in v0.5: der echte DLSS-5-Look.**
+- Frühere Versionen haben die Detail-Teile des Netzes in 720p/540p gerechnet, also mit einem Viertel von NVIDIAs Pixeln, deshalb wirkte der Effekt schwach. **v0.5 rechnet sie in deiner Ausgabe-Auflösung** (Hybrid-Modus, Standard): etwa **3x** der Effekt von v0.4 in Cyberpunk bei 1440p.
+- **Ghosting behoben** in Spielen mit Upscaler (Bewegungsvektoren waren falsch skaliert), **sauberes `nr_split`** (Ergebnisse werden eingeblendet), **Absturz behoben** beim Neuaufsetzen von NR.
+- **Cyberpunk 2077, 1440p, FSR 4.1 Qualität, RX 6900 XT:** etwa **35 FPS** mit vollem Look (`Hybrid_1440`), etwa **45 FPS** mit `Hybrid_1440_Fast`.
+- Neue Presets: `Hybrid_1440` (Standard), `Hybrid_1440_Fast`, `Hybrid_1080`, `Hybrid_4K`, `Full_1440`, `Full_1080`. Alte Presets in `presets/classic`.
+- Vollständige Liste und Performance-Tabelle: [Release-Notes](../../releases/tag/v0.5) und [CHANGELOG.md](CHANGELOG.md).
+
 **Neu in v0.4:**
 - **NVIDIAs neues DLSS-5-Modell** (nvngx_dlssnr.dll 310.9.16) wird automatisch genutzt: etwa **halb so schwer**, ~10 ms pro Netz-Durchlauf bei 960x540 auf einer RX 6900 XT (v0.3: 24 ms). Die alte 310.8 läuft weiter mit dem alten Modell.
 - **Cyberpunk 2077, 1440p, FSR Qualität, ohne Frame Generation, RX 6900 XT:** 54,7 FPS auf Hoch, 85,3 FPS auf Niedrig (v0.3: 43,8 FPS auf Hoch; danielblnc v0.6.0 auf derselben Karte: 21,7 FPS).

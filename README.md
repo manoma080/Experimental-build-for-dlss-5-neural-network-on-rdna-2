@@ -14,6 +14,21 @@ This mod makes it run on **AMD Radeon RX 6000** graphics cards (RDNA2).
 > **Experimental.** It can crash, look wrong, or cost a lot of FPS. Do not use it in online games with
 > anti-cheat.
 
+**New in v0.5: the real DLSS 5 look.**
+- Earlier versions ran the network's detail blocks at 720p/540p, a quarter of NVIDIA's pixels, so the effect looked weak. **v0.5 runs them at your output resolution** (hybrid mode, default): about **3x** the effect of v0.4 in Cyberpunk at 1440p.
+- **Ghosting fixed** in games with an upscaler (motion vectors were scaled wrong), **clean `nr_split`** (results fade in), **crash fixed** when NR is re-created.
+- **Cyberpunk 2077, 1440p, FSR 4.1 Quality, RX 6900 XT:** about **35 FPS** with the full look (`Hybrid_1440`), about **45 FPS** with `Hybrid_1440_Fast`.
+- New presets: `Hybrid_1440` (default), `Hybrid_1440_Fast`, `Hybrid_1080`, `Hybrid_4K`, `Full_1440`, `Full_1080`. Old presets in `presets/classic`.
+- Full list and performance table: [release notes](../../releases/tag/v0.5) and [CHANGELOG.md](CHANGELOG.md).
+
+| Preset (RX 6900 XT, new model) | Network per frame | Look |
+|---|---|---|
+| **Hybrid_1440** (default) | ~14-16 ms | near-full DLSS 5 |
+| **Hybrid_1440_Fast** | ~10 ms | near-full, moving people can shimmer more |
+| **Hybrid_1080** | ~9 ms | near-full at 1080p |
+| **Full_1440** | ~24 ms | full detail |
+| `classic/` 720p / 540p | 3-7 ms | only a fraction of the effect |
+
 **New in v0.4:**
 - **NVIDIA's new DLSS 5 model** (nvngx_dlssnr.dll 310.9.16) is used automatically: about **2x lighter**, ~10 ms per network run at 960x540 on an RX 6900 XT (v0.3: 24 ms). The old 310.8 DLL still works with the old model.
 - **Cyberpunk 2077, 1440p, FSR Quality, no frame generation, RX 6900 XT:** 54.7 fps on High, 85.3 fps on Low (v0.3: 43.8 fps on High; danielblnc v0.6.0 on the same card: 21.7 fps).
@@ -42,15 +57,15 @@ You need **all** of these:
 | ✅ Game | A 64-bit DirectX 11 or DirectX 12 game where you can choose **DLSS, FSR or XeSS** in the graphics settings |
 | ✅ NVIDIA model file | `nvngx_dlssnr.dll`. **Not included**, you have to get it yourself (see step 2) |
 
-| Graphics card | Status (v0.4) | Network time per run, new model, 960x540 |
+| Graphics card | Status | Network per frame, Hybrid_1440 (v0.5) |
 |---|---|---|
-| RX 6900 XT / 6950 XT | ✅ tested | ~10 ms (measured) |
-| RX 6800 / 6800 XT | ✅ works (user reports) | ~11-14 ms (estimate) |
-| RX 6700 / 6700 XT / 6750 XT | ✅ works (user reports) | ~18-20 ms (estimate) |
-| RX 6600 / 6600 XT / 6650 XT | ✅ works (user reports) | ~25-30 ms (estimate) |
-| RX 6500 XT / 6400 | 🧪 should work, slow | 50 ms+ (estimate) |
+| RX 6900 XT / 6950 XT | ✅ tested | ~14-16 ms (measured) |
+| RX 6800 / 6800 XT | ✅ works (user reports) | ~16-21 ms (estimate) |
+| RX 6700 / 6700 XT / 6750 XT | ✅ works (user reports) | ~30 ms (estimate; use Hybrid_1080) |
+| RX 6600 / 6600 XT / 6650 XT | ✅ works (user reports) | ~45 ms (estimate; use Hybrid_1080 or classic) |
+| RX 6500 XT / 6400 | 🧪 should work, slow | use `classic/` presets |
 
-**v0.4 runs on the whole RX 6000 (RDNA2) family.** First user reports average **about 55 FPS** in game. More reports
+**Runs on the whole RX 6000 (RDNA2) family.** First user reports average **about 55 FPS** in game. More reports
 are welcome in [Issues](../../issues) (attach your `dlssnr_nr.log`, it lists your GPU and timings).
 
 Not sure which graphics card you have? Press `Ctrl + Shift + Esc`, click **Performance**, click **GPU**.
@@ -164,12 +179,12 @@ For the best image, combine NR with FSR 4 as the upscaler. FSR 4 does not offici
 [fsr4-shader-performance-overrides](https://github.com/zgauthier2000/fsr4-shader-performance-overrides) makes it work
 there. Get it from that project and follow its instructions; it is not part of this ZIP.
 
-## Known issues (v0.4)
+## Known issues (v0.5)
 
-- **Higher network resolutions (1080p / 1440p) can show artefacts, ghosting and odd lighting** in some games, and the visible gain over 540p is smaller than expected. We are investigating; 960x540 (Standard) is the recommended setting.
-- Strong settings (intensity 2, tone 2, Cinematic) make the effect much stronger but also increase flicker.
-- Ghosting can appear on fast motion with `nr_split=3/4`; set `nr_split=0` and `edit_temporal=0` in `nr_port.ini` to compare.
-- A few rare crash/edge cases found in an internal code review (feature released while in use, format mismatches, a >500 ms stall during split frames) will be fixed in the next update.
+- Minimal white noise and slight ghosting on very fast motion remain with `nr_split`. For the cleanest picture use `nr_split=0` (slowest).
+- Strong settings (intensity 2, tone 2, Cinematic) make the effect much stronger but also increase flicker; that is NVIDIA's network itself.
+- With `Hybrid_1440_Fast` (`nr_split=3`) moving people can shimmer more.
+- Games without motion vectors (no upscaler selected) trail with `nr_split`; select FSR, DLSS or XeSS in the game.
 
 ## It does not work. What now?
 

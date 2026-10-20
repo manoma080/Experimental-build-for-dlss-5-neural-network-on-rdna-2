@@ -19,6 +19,7 @@
 #include <thread>
 #include <condition_variable>
 #include <atomic>
+#include <algorithm>
 #ifdef _WIN32
 #include <windows.h>
 #include <compressapi.h>
@@ -43,13 +44,18 @@ struct nr_ctx {
   // No GPU-side cross-API wait (hipStreamWaitValue32 hung the HIP queue forever when D3D12 never wrote flag_in -> TDR/PC freeze on 2026-10-08):
   // a CPU thread polls flag_in with a timeout and only then launches the frame.
   hipStream_t s = nullptr, ps = nullptr; uint32_t* hf = nullptr; std::thread th; std::condition_variable cv; struct Job { unsigned seq; int hv, part; }; std::deque<Job> q;
+  bool job_ok = false;   // ext thread: the job in flight got its part 1 (input, strength, history) on the GPU
   std::atomic<bool> stop{false}; std::atomic<int> inflight{0};
   // temporal history (nr_run2 / nr_ext_enqueue2): own PAD_H x PAD_W x RGB32F buffer, pointed to by pre-block +0x40 and post-block +0x40 when valid
   float* hist = nullptr; uint64_t netout = 0; int hist_mask = 0; unsigned ph = 0, pw = 0; bool have_prev = false; int dbg_n = 0; size_t io_size = 0, hin = 0, hout = 0;
   std::vector<hipEvent_t> prof; std::vector<std::string> names;   // NR_PROF only
+  int seed_mode = 0; unsigned seed_n = 0, seed_cur = 0;   // nr_set_seed_mode(1): pre-block seed (+0x24) = frames since the last no-history frame (NVIDIA counts frames; 0 without history)
   int nsplit = 0, kb[2][9] = {};   // nr_ext_split(n): parts per job (0 = no split); kb[full|skipping][j] = first dispatch of part j+1 (kb[.][0] = 0, kb[.][nsplit] = n)
-  std::atomic<bool> broken{false}; long checked = 0;   // output self-check (ext path): broken -> nr_ext_enqueue* returns -2, the DLL stays native
+  std::atomic<bool> broken{false}; long checked = 0; std::vector<uint16_t> chk_in;   // chk_in: the self-checked job's input, read at its part 1 (io input is the next frame's by the time the output lands)   // output self-check (ext path): broken -> nr_ext_enqueue* returns -2, the DLL stays native
   int devid = 0;   // HIP device of this context; HIP's current device is per thread, so every entry point selects it
+  // vit_every motion gate (nr_ext_motion): a reuse frame whose mean |mv| (one vector per bottleneck px, model px, from the DLL at io+mv_off)
+  // is above `gate` runs in full instead; f0 = frame of the last gated full run (the cadence restarts there).
+  float gate = 0; size_t mv_off = 0; long f0 = 0; float* mvh = nullptr; int H5 = 0, W5 = 0, bs = 0, nx = 0, ny = 0; int checks = 0, gated = 0; double mv_sum = 0;
 };
 #ifndef NR_BUILD_ID
 #define NR_BUILD_ID __DATE__ " " __TIME__
@@ -302,6 +308,17 @@ NR_API nr_ctx* nr_create(const char* data_dir, int width, int height, int vit_ev
     if (c->vit_lo < 0 || c->vit_hi >= (int)c->names.size() || c->names[c->vit_lo].find("ffwd2") == std::string::npos || c->names[c->vit_hi].find("swin") == std::string::npos)
       FAIL("bottleneck reuse: unexpected dispatch layout around %d..%d", c->vit_lo, c->vit_hi);
     }
+    // the reused tensor = the decoder's input: the last c512 conv's planes copy (Conv2Params out2 +0x20, H +0x30, W +0x34; one of H / W
+    // padded to the attention window). The motion gate samples one vector per px of it.
+    const Step& lb = c->steps[c->vit_hi - 1]; uint64_t o2 = 0; int32_t hw[2] = {}; const unsigned ph = (unsigned)num("pad_h"), pw = (unsigned)num("pad_w");
+    const auto& lk = lb.ov ? lb.src : lb.ka;   // native override: its original kernarg
+    if (c->names[c->vit_hi - 1] == "k_conv2_n" && lk.size() >= 0x38) { memcpy(&o2, lk.data() + 0x20, 8); memcpy(hw, lk.data() + 0x30, 8); }
+    const int bs = hw[0] > 0 && hw[1] > 0 ? (int)lround((std::max)((double)ph / hw[0], (double)pw / hw[1])) : 0;   // px size: the bottleneck pads H (1440p: 48 rows for 1472) or W to its window, so the larger ratio is the unpadded one
+    if (o2 && bs > 0) {
+      c->H5 = hw[0]; c->W5 = hw[1]; c->bs = bs;
+      c->nx = (std::min)(c->W5, (width - c->bs / 2 + c->bs - 1) / c->bs); c->ny = (std::min)(c->H5, (height - c->bs / 2 + c->bs - 1) / c->bs);   // px whose centre is inside the image
+      HK(hipHostMalloc((void**)&c->mvh, 16 + (size_t)c->H5 * c->W5 * 8));
+    } else rlog("bottleneck reuse: no motion gate for this data dir (step %d %s, ov %d, ka %zu, out2 %llx, H %d W %d, pad_h %u)", c->vit_hi - 1, c->names[c->vit_hi - 1].c_str(), (int)lb.ov, lb.ka.size(), (unsigned long long)o2, hw[0], hw[1], ph);
   }
   if (c->pw) HK(hipMalloc(&c->hist, (size_t)c->pw * c->ph * 12));   // ~8 MB; filled after every frame so the first hist_valid frame already has history
   HK(hipEventCreate(&c->e0)); HK(hipEventCreate(&c->e1));
@@ -326,6 +343,12 @@ static bool hist_begin(nr_ctx* c, hipStream_t s, int valid, const uint8_t* src) 
       uint64_t p = (st.pre ? mask & 1 : mask & 2) ? (uint64_t)c->hist : 0; auto& k = st.ov ? st.src : st.ka;
       if (k.size() >= 0x48) { memcpy(k.data() + 0x40, &p, 8); if (st.ov) nr_apply_override(*st.ov, st.src, st.ka); } }
     c->hist_mask = mask;
+  }
+  if (c->seed_mode) {   // NVIDIA: the frame counter is the noise seed, held at 0 while there is no history
+    c->seed_n = v ? c->seed_n + 1 : 0;
+    if (c->seed_n != c->seed_cur) {
+      for (auto& st : c->steps) if (st.pre) { auto& k = st.ov ? st.src : st.ka; if (k.size() >= 0x28) { memcpy(k.data() + 0x24, &c->seed_n, 4); if (st.ov) nr_apply_override(*st.ov, st.src, st.ka); } }
+      c->seed_cur = c->seed_n; }
   }
   return true;
 }
@@ -365,7 +388,7 @@ NR_API int nr_get_strength(nr_ctx* c, float* tone, float* structure, float* a, f
   if (tone) *tone = v[0]; if (structure) *structure = v[1]; if (a) *a = v[2]; if (b) *b = v[3]; return 0;
 }
 
-static bool skipping(nr_ctx* c) { return c->vit_every > 1 && (c->frame % c->vit_every) != 0; }   // frame 0 always computes
+static bool skipping(nr_ctx* c) { return c->vit_every > 1 && ((c->frame - c->f0) % c->vit_every) != 0; }   // frame 0 (and a motion-gated frame, f0) always computes
 static bool launch_range(nr_ctx* c, hipStream_t st, size_t lo, size_t hi) {   // the network's dispatches [lo, hi), in manifest order
   bool skip_vit = skipping(c);
   for (size_t i = lo; i < hi && i < c->steps.size(); i++) {
@@ -408,7 +431,7 @@ NR_API int nr_dbg_steps(nr_ctx* c, int n) { if (!c) return 1; c->dbg_n = n; retu
 NR_API int nr_dbg_read(nr_ctx* c, unsigned long long off, unsigned long long size, void* dst) {
   if (!c || off + size > c->arena) return 1; return hipMemcpy(dst, c->d + PAD + off, size, hipMemcpyDeviceToHost) != hipSuccess;
 }
-NR_API int nr_reset(nr_ctx* c) { use_dev(c); c->frame = 0; c->have_prev = false; return upload_arena(c) ? 0 : 1; }
+NR_API int nr_reset(nr_ctx* c) { use_dev(c); c->frame = 0; c->f0 = 0; c->have_prev = false; return upload_arena(c) ? 0 : 1; }
 
 static void ext_thread(nr_ctx* c);
 #ifdef _WIN32
@@ -445,8 +468,9 @@ static float h2f_(uint16_t h) { uint32_t s = (h & 0x8000u) << 16, e = (h >> 10) 
   float f; memcpy(&f, &u, 4); return f; }
 static void self_check(nr_ctx* c) {
   if (getenv("NR_SELFCHECK_TEST") && atoi(getenv("NR_SELFCHECK_TEST"))) hipMemsetAsync(c->io + c->out_off, 0xFF, c->dst_size, c->s);   // all NaN
-  const size_t n = c->dst_size < c->src_size ? c->dst_size : c->src_size; std::vector<uint16_t> in(n / 2), out(n / 2);
-  if (hipMemcpyAsync(in.data(), c->io, n, hipMemcpyDeviceToHost, c->s) != hipSuccess || hipMemcpyAsync(out.data(), c->io + c->out_off, n, hipMemcpyDeviceToHost, c->s) != hipSuccess ||
+  const size_t n = c->dst_size < c->src_size ? c->dst_size : c->src_size; std::vector<uint16_t> in = std::move(c->chk_in), out(n / 2);
+  if (in.size() != n / 2) { rlog("selfcheck: no input snapshot of this job - skipped"); return; }   // v0.4.3 read io's input here: by now the D3D12 side may have imported the next frame (|out-in| inflated by motion)
+  if (hipMemcpyAsync(out.data(), c->io + c->out_off, n, hipMemcpyDeviceToHost, c->s) != hipSuccess ||
       hipStreamSynchronize(c->s) != hipSuccess) { rlog("selfcheck: readback failed - skipped"); return; }
   size_t px = 0, bad = 0, bwo = 0, bwi = 0; double mean = 0, dif = 0;
   auto bw = [](const float* v) { return (v[0] <= 0 && v[1] <= 0 && v[2] <= 0) || (v[0] >= 1 && v[1] >= 1 && v[2] >= 1); };
@@ -459,6 +483,21 @@ static void self_check(nr_ctx* c) {
   rlog("selfcheck: %zu px sampled, non-finite %.2f%%, black/white out %.1f%% (in %.1f%%), mean %.4f, mean |out-in| %.4f",
        px, 100 * fb, 100 * fo, 100 * fi, ok ? mean / (3 * ok) : 0.0, ok ? dif / (3 * ok) : 0.0);
   if (fb > 0.001 || fo - fi >= 0.30) { c->broken = true; rlog("selfcheck: NR output looks broken on this GPU - disabling (native frames for this session)"); }
+}
+// Reuse frame (vit_every, ext path): read the DLL's motion cells (tag = seq when written this frame); mean |mv| > gate model px: run this
+// frame in full (the cadence restarts). No vectors this frame: plain reuse.
+static void motion_step(nr_ctx* c, unsigned seq) {
+  const size_t n = (size_t)c->H5 * c->W5 * 8; uint32_t tag = 0;
+  bool ok = hipMemcpyAsync(c->mvh, c->io + c->mv_off - 16, 16 + n, hipMemcpyDeviceToHost, c->ps) == hipSuccess && hipStreamSynchronize(c->ps) == hipSuccess;
+  if (ok) memcpy(&tag, c->mvh, 4);
+  ok = ok && tag == seq;
+  double sum = 0; const float* m = c->mvh + 4;
+  if (ok) for (int y = 0; y < c->ny; y++) for (int x = 0; x < c->nx; x++) {
+    const float* v = m + 2 * (y * c->W5 + x); const double a = sqrt((double)v[0] * v[0] + (double)v[1] * v[1]); sum += a == a ? a : 1e9; }
+  const double mean = sum / ((double)c->nx * c->ny);
+  if (ok && mean > c->gate) { c->f0 = c->frame; c->gated++; }
+  if (ok) c->mv_sum += mean;
+  if (++c->checks == 600) { rlog("vit reuse: %d of 600 reuse frames ran in full (motion gate %.2f), mean |mv| %.2f model px", c->gated, c->gate, c->mv_sum / 600); c->checks = c->gated = 0; c->mv_sum = 0; }
 }
 static const int kExtWaitMs = 500;   // flag_in wait bound; longer than the D3D12 spin bound, so a late frame is dropped on both sides
 static void ext_thread(nr_ctx* c) {
@@ -475,10 +514,19 @@ static void ext_thread(nr_ctx* c) {
       Sleep(0);
     }
 #endif
-    if (ready) {   // late/never-executed frame: skip it; D3D12's bounded spin shows the native frame
+    // Test hook NR_TEST_DROP_PART=n: treat the n-th job start (part 0/1) as never executed (its flag_in wait timed out)
+    static const int drop = getenv("NR_TEST_DROP_PART") ? atoi(getenv("NR_TEST_DROP_PART")) : 0; static int starts = 0;
+    if (part <= 1 && ++starts == drop) { ready = false; rlog("runtime: NR_TEST_DROP_PART: job %d (seq %u) dropped", starts, seq); }
+    // nr_split: a job whose part 1 was dropped has no input in the arena; its later parts must not run on it (stale arena)
+    c->job_ok = part <= 1 ? ready : c->job_ok && ready;
+    if (c->job_ok && part <= 1 && c->mv_off && skipping(c)) motion_step(c, seq);   // vit_motion_gate: a reuse job with too much motion runs in full (the cadence restarts)
+    if (c->job_ok) {   // late/never-executed frame (or a part of a dropped job): skip it; D3D12's bounded spin shows the last edit / native frame
       hipStream_t s = c->s; const size_t n = c->steps.size(); const int* b = c->kb[skipping(c)]; const bool last = part == 0 || part == c->nsplit;   // part j = [kb[j-1], kb[j]); the arena keeps everything in between
       const size_t lo = part > 1 ? (size_t)b[part - 1] : 0, hi = last ? n : (size_t)b[part];
       bool ok = true;
+      if (part <= 1 && c->checked == 9) {   // the job self_check will look at: keep its input (io's input belongs to the D3D12 side again once this job's flag is out)
+        const size_t ci = c->dst_size < c->src_size ? c->dst_size : c->src_size; c->chk_in.resize(ci / 2);
+        if (hipMemcpyAsync(c->chk_in.data(), c->io, ci, hipMemcpyDeviceToHost, s) != hipSuccess || hipStreamSynchronize(s) != hipSuccess) c->chk_in.clear(); }
       if (part <= 1) { apply_strength(c);
         ok = hipMemcpyAsync(c->d + PAD + c->off_src, c->io, c->src_size, hipMemcpyDeviceToDevice, s) == hipSuccess &&
              hist_begin(c, s, hv, hv && c->hin ? c->io + c->hin : nullptr) &&
@@ -503,6 +551,16 @@ NR_API int nr_ext_history(nr_ctx* c, unsigned long long hist_in_off, unsigned lo
   for (unsigned long long o : {hist_in_off, hist_out_off}) if (o && (o < c->src_size || o + n > c->io_size || o % 4)) return 2;
   c->hin = hist_in_off; c->hout = hist_out_off; return 0;
 }
+// vit_every motion gate (after nr_ext_open): the DLL writes, every NR frame, u32 seq at io+mv_off-16 and one float2 (model px, previous =
+// current + mv) per cell of *cell model px at io+mv_off + (cy * *cells_w + cx) * 8, from the cell's centre pixel. A reuse frame whose mean
+// |mv| > gate runs in full. Returns 1 when this context cannot (not reuse=bottleneck, unknown layout, gate <= 0).
+NR_API int nr_ext_motion(nr_ctx* c, unsigned long long mv_off, float gate, unsigned* cell, unsigned* cells_w) {
+  if (!c || !c->io || !c->mvh || mv_off < c->src_size + 16 || mv_off % 16 || mv_off + (size_t)c->H5 * c->W5 * 8 > c->io_size || !(gate > 0)) return 1;
+  c->mv_off = (size_t)mv_off; c->gate = gate; if (cell) *cell = (unsigned)c->bs; if (cells_w) *cells_w = (unsigned)c->W5;
+  rlog("vit reuse: motion gate on (mean |mv| > %.2f model px -> full run), %dx%d cells of %d px", gate, c->nx, c->ny, c->bs);
+  return 0;
+}
+NR_API int nr_set_seed_mode(nr_ctx* c, int mode) { if (!c) return 1; c->seed_mode = mode ? 1 : 0; return 0; }   // set before the first frame
 NR_API int nr_ext_enqueue2(nr_ctx* c, unsigned seq, int max_inflight, int hist_valid) { return nr_ext_enqueue3(c, seq, max_inflight, hist_valid, 0); }
 NR_API int nr_ext_enqueue3(nr_ctx* c, unsigned seq, int max_inflight, int hist_valid, int part) {
   if (!c || !c->s || part < 0 || part > c->nsplit) return -1;
@@ -520,14 +578,14 @@ NR_API int nr_ext_splitn(nr_ctx* c, int np, int* k_full, int* k_skip, float* ms)
   std::vector<double> t(n, 0.0); bool meas = false; for (int j = 0; j < np - 1; j++) meas |= k_full[j] <= 0 || k_skip[j] <= 0;
   if (meas) {
     std::vector<hipEvent_t> ev(n + 1); for (auto& e : ev) if (hipEventCreate(&e) != hipSuccess) return 2;
-    bool ok = true; const long f0 = c->frame; c->frame = 0;   // frame 0: every dispatch runs
+    bool ok = true; const long f0 = c->frame, g0 = c->f0; c->frame = 0; c->f0 = 0;   // frame 0: every dispatch runs
     for (int r = 0; r < 3 && ok; r++) {
       ok = hipEventRecord(ev[0], c->s) == hipSuccess;
       for (int i = 0; i < n && ok; i++) ok = launch_range(c, c->s, i, i + 1) && hipEventRecord(ev[i + 1], c->s) == hipSuccess;
       ok = ok && hipStreamSynchronize(c->s) == hipSuccess;
       for (int i = 0; i < n && ok && r; i++) { float ms = 0; hipEventElapsedTime(&ms, ev[i], ev[i + 1]); t[i] += ms; }
     }
-    c->frame = f0; for (auto& e : ev) hipEventDestroy(e); if (!ok) return 3;
+    c->frame = f0; c->f0 = g0; for (auto& e : ev) hipEventDestroy(e); if (!ok) return 3;
   }
   auto runs = [&](bool skip, int i) { return !(skip && c->vit_every > 1 && i >= c->vit_lo && i < c->vit_hi); };
   auto pick = [&](bool skip, int* k) {   // greedy: point j at the dispatch where the running sum is nearest j/N of the total, strictly increasing
@@ -567,6 +625,7 @@ NR_API void nr_destroy(nr_ctx* c) {
   for (auto m : c->mods) hipModuleUnload(m);
   if (c->d) hipFree(c->d);
   if (c->hist) hipFree(c->hist);
+  if (c->mvh) hipHostFree(c->mvh);
   if (c->e0) hipEventDestroy(c->e0); if (c->e1) hipEventDestroy(c->e1); for (auto e : c->prof) if (e) hipEventDestroy(e);
   for (auto b : c->i8bufs) hipFree(b);
   delete c;
