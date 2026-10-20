@@ -17,6 +17,9 @@ This project runs **NVIDIA's own DLSS 5 network** (from NVIDIA's `nvngx_dlssnr.d
 RX 6000 (RDNA2)** cards, which have no AI hardware at all. It is a full re-implementation of the network's inference in
 **our own HIP compute kernels**, written for RDNA2, plus a DirectX bridge that plugs it into games through OptiScaler.
 
+**No HIP SDK or ROCm install needed.** The HIP runtime the port uses (`amdhip64_6.dll`) ships with the normal AMD
+Adrenalin driver. You only need a recent driver, the ZIP and NVIDIA's `nvngx_dlssnr.dll`.
+
 > **Experimental.** It can crash, look wrong, or cost a lot of FPS. Do not use it in online games with anti-cheat.
 
 ### Why v0.5 is different
@@ -101,7 +104,7 @@ You need **all** of these:
 |---|---|
 | ✅ Graphics card | AMD **RX 6000 series**, see the table below. RX 7000/9000, NVIDIA and Intel do **not** work. |
 | ✅ Windows | Windows 10 or 11, 64-bit |
-| ✅ AMD driver | A recent AMD Adrenalin driver ([download](https://www.amd.com/en/support/download/drivers.html)) |
+| ✅ AMD driver | A recent AMD Adrenalin driver ([download](https://www.amd.com/en/support/download/drivers.html)). **Nothing else:** no HIP SDK, no ROCm. |
 | ✅ Game | A 64-bit DirectX 11 or DirectX 12 game where you can choose **DLSS, FSR or XeSS** in the graphics settings |
 | ✅ NVIDIA model file | `nvngx_dlssnr.dll`. **Not included**, you have to get it yourself (see step 2) |
 

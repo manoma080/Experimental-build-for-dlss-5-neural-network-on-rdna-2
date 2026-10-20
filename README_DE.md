@@ -10,6 +10,8 @@
 
 Technische Details (Netzarchitektur, Kernel, Performance): siehe [README.md](README.md#how-it-works-technical).
 
+**Kein HIP SDK und kein ROCm nötig.** Die HIP-Laufzeit (`amdhip64_6.dll`) kommt mit dem normalen AMD-Adrenalin-Treiber. Du brauchst nur einen aktuellen Treiber, die ZIP und NVIDIAs `nvngx_dlssnr.dll`.
+
 ## Was ist das?
 
 NVIDIA hat eine neue Grafik-Funktion gebaut: **DLSS Neural Rendering** („DLSS 5“). Damit sehen Spiele
@@ -52,7 +54,7 @@ Du brauchst **alles** davon:
 |---|---|
 | ✅ Grafikkarte | AMD **RX-6000-Serie**, siehe Tabelle unten. RX 7000/9000, NVIDIA und Intel gehen **nicht**. |
 | ✅ Windows | Windows 10 oder 11, 64-Bit |
-| ✅ AMD-Treiber | Ein aktueller AMD-Adrenalin-Treiber ([Download](https://www.amd.com/de/support/download/drivers.html)) |
+| ✅ AMD-Treiber | Ein aktueller AMD-Adrenalin-Treiber ([Download](https://www.amd.com/de/support/download/drivers.html)) **Sonst nichts:** kein HIP SDK, kein ROCm. |
 | ✅ Spiel | Ein 64-Bit-Spiel mit DirectX 11 oder 12, in dem du in den Grafikeinstellungen **DLSS, FSR oder XeSS** auswählen kannst |
 | ✅ NVIDIA-Modelldatei | `nvngx_dlssnr.dll`. **Nicht dabei**, die musst du dir selbst besorgen (Schritt 2) |
 
