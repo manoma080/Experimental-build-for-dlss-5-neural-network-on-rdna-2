@@ -2,7 +2,13 @@
 
 **English:** [README.md](README.md)
 
-![Beispiel im Spiel](images/ingame2.jpg)
+![DLSS 5 aus vs an, Cyberpunk 2077, RX 6900 XT](images/v05_compare.jpg)
+
+<p align="center"><img src="images/v05_face.jpg" alt="Gesicht, DLSS 5 aus vs an" width="720"></p>
+
+<p align="center"><i>Cyberpunk 2077, 1440p, FSR 4.1 Qualität, RX 6900 XT, v0.5 Standard (Hybrid_1440). Links aus, rechts an. ~35 FPS.</i></p>
+
+Technische Details (Netzarchitektur, Kernel, Performance): siehe [README.md](README.md#how-it-works-technical).
 
 ## Was ist das?
 
