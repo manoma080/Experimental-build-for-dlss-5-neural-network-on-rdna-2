@@ -1,33 +1,79 @@
 # DLSS 5 Neural Rendering on AMD RX 6000 cards (experimental)
 
-**Deutsch:** [README_DE.md](README_DE.md)
+**Deutsch:** [README_DE.md](README_DE.md) · **Download:** [latest release (v0.5)](../../releases/latest) · **Changes:** [CHANGELOG.md](CHANGELOG.md)
 
-![In-game example](images/ingame2.jpg)
+![DLSS 5 off vs on, Cyberpunk 2077, RX 6900 XT](images/v05_compare.jpg)
+
+<p align="center"><img src="images/v05_face.jpg" alt="Face detail, DLSS 5 off vs on" width="720"></p>
+
+<p align="center"><i>Cyberpunk 2077, 1440p, FSR 4.1 Quality, RX 6900 XT, v0.5 default settings (Hybrid_1440). Left: DLSS 5 off. Right: on. ~35 FPS.</i></p>
 
 ## What is this?
 
-NVIDIA made a new graphics feature called **DLSS Neural Rendering** ("DLSS 5"). It makes games look
-more realistic: better light, more detail, nicer colours. Normally it **only works on NVIDIA cards**.
+NVIDIA's **DLSS Neural Rendering** ("DLSS 5") is a neural network that re-renders every frame: more realistic light,
+skin, materials and contrast. NVIDIA only ships it for GeForce RTX cards with Tensor Cores.
 
-This mod makes it run on **AMD Radeon RX 6000** graphics cards (RDNA2).
+This project runs **NVIDIA's own DLSS 5 network** (from NVIDIA's `nvngx_dlssnr.dll`, which you supply) on **AMD Radeon
+RX 6000 (RDNA2)** cards, which have no AI hardware at all. It is a full re-implementation of the network's inference in
+**our own HIP compute kernels**, written for RDNA2, plus a DirectX bridge that plugs it into games through OptiScaler.
 
-> **Experimental.** It can crash, look wrong, or cost a lot of FPS. Do not use it in online games with
-> anti-cheat.
+> **Experimental.** It can crash, look wrong, or cost a lot of FPS. Do not use it in online games with anti-cheat.
 
-**New in v0.5: the real DLSS 5 look.**
-- Earlier versions ran the network's detail blocks at 720p/540p, a quarter of NVIDIA's pixels, so the effect looked weak. **v0.5 runs them at your output resolution** (hybrid mode, default): about **3x** the effect of v0.4 in Cyberpunk at 1440p.
-- **Ghosting fixed** in games with an upscaler (motion vectors were scaled wrong), **clean `nr_split`** (results fade in), **crash fixed** when NR is re-created.
-- **Cyberpunk 2077, 1440p, FSR 4.1 Quality, RX 6900 XT:** about **35 FPS** with the full look (`Hybrid_1440`), about **45 FPS** with `Hybrid_1440_Fast`.
-- New presets: `Hybrid_1440` (default), `Hybrid_1440_Fast`, `Hybrid_1080`, `Hybrid_4K`, `Full_1440`, `Full_1080`. Old presets in `presets/classic`.
-- Full list and performance table: [release notes](../../releases/tag/v0.5) and [CHANGELOG.md](CHANGELOG.md).
+### Why v0.5 is different
 
-| Preset (RX 6900 XT, new model) | Network per frame | Look |
-|---|---|---|
-| **Hybrid_1440** (default) | ~14-16 ms | near-full DLSS 5 |
-| **Hybrid_1440_Fast** | ~10 ms | near-full, moving people can shimmer more |
-| **Hybrid_1080** | ~9 ms | near-full at 1080p |
-| **Full_1440** | ~24 ms | full detail |
-| `classic/` 720p / 540p | 3-7 ms | only a fraction of the effect |
+- **The real look, finally.** The network has full-resolution detail blocks (skin pores, cloth, fine contrast) and a
+  half-resolution main network. Earlier versions (ours and other ports) ran the whole network at 540p/720p, i.e. the
+  detail at a quarter of NVIDIA's pixels. **v0.5 runs the detail blocks at your output resolution** ("hybrid mode").
+  Measured in Cyberpunk at 1440p: **~3x** the on/off difference of our old 720p default, ~78 % of all pixels changed.
+- **Fast enough to play:** ~35 FPS at 1440p with the full look, ~45 FPS with `Hybrid_1440_Fast` (RX 6900 XT, no frame generation).
+- **No ghosting on upscaled games:** motion vectors from the upscaler (render resolution) are now scaled correctly.
+- **All kernels are our own.** No NVIDIA code or data in the package; the weights are read from your copy of NVIDIA's DLL at load time.
+
+## How it works (technical)
+
+```
+ game frame ──► OptiScaler ──► nvngx.dll_dlssnr.dll (D3D12/D3D11 bridge) ──► nr_runtime.dll (HIP, RDNA2) ──► back to the game
+ (after FSR/DLSS/XeSS)          colour, depth, motion       import / export shaders,    the DLSS 5 network,
+                                vectors, NR sliders         history, nr_split warp      ~80 GPU dispatches
+```
+
+**The network** (NVIDIA's 310.9.16 "small" model, also the older 310.8 model):
+full-resolution **pre block** (features + a Swin block) → U-Net encoder with **Swin window-attention** levels
+(C = 32/64/128/256) → a **ViT** bottleneck (8 blocks, global attention) and C=512 conv/attention blocks → decoder → full-resolution **post block**
+that produces the edit. Weights and activations are **FP8 (e4m3)**; NVIDIA runs this on FP8 Tensor Cores.
+
+**On RDNA2 (no Tensor Cores, no FP8):**
+- Every GEMM runs on `v_dot2_f32_f16` (2 MACs/lane/clock) or `v_dot4_i32_i8` (int8 paths), with exact FP8 rounding emulated
+  in software (`q8`/e4m3 packing in 1-2 instructions). The network output matches the PyTorch reference implementation at
+  **37-43 dB** with edit correlation **0.96-0.99**.
+- **Lane = token** Swin kernels (c32, c64, pre/post): one 8x8 window per 64-thread workgroup, weights streamed through
+  SGPRs from a load-time shadow, attention exchanged through 12 KB of LDS (5 workgroups per CU). The new c64 kernel is
+  ~25 % faster than the previous design and byte-identical.
+- **ViT / C512 GEMMs:** 8x4 register tiles, 128 threads, LDS operand prefetch, swizzled LDS layout without bank conflicts.
+- **Hybrid resolution:** pre/post blocks at output size, the U-Net/ViT 1.5x smaller, bridged by a resample kernel.
+- **Temporal amortisation** (`nr_split`): the network runs over 2-3 frames; every displayed frame warps the newest result
+  with the game's motion vectors, rejects disoccluded areas by colour/depth gates, fills them from the surroundings and
+  fades new results in. The ViT reuse switches itself off on fast camera motion.
+- **D3D12 ↔ HIP** share memory and fences; the game never waits longer than the network's share of the frame.
+
+## Performance (RX 6900 XT, new model 310.9.16)
+
+| Preset | Network | Per displayed frame | Cyberpunk 1440p | Look |
+|---|---|---|---|---|
+| **Hybrid_1440** (default) | 28-32 ms | ~14-16 ms (`nr_split=2`) | **~35 FPS** | near-full DLSS 5 |
+| **Hybrid_1440_Fast** | 28-32 ms | ~10 ms (`nr_split=3`) | **~45 FPS** | near-full; moving people shimmer more |
+| **Hybrid_1080** | 17-19 ms | ~9 ms | – | near-full at 1080p |
+| **Full_1440** | 48 ms | ~24 ms | ~25 FPS | NVIDIA's full layout |
+| `classic/` 720p / 540p | 14 / 9 ms | 3-7 ms | – | only a fraction of the effect |
+
+Measured on the same RX 6900 XT at 720p, same new model, same benchmark harness: **this port 10.8 ms vs 19.4 ms** for another
+public vendor-neutral port of the network. With frame generation (FSR-FG / XeFG) the displayed frame rate roughly doubles.
+
+**New in v0.5** (full list in the [release notes](../../releases/tag/v0.5)): hybrid mode at output resolution, ghosting fix for
+upscaled motion vectors, clean `nr_split` (fade-in, halo fix, motion gate), crash fix when NR is re-created, faster
+c64/ViT kernels, new presets `Hybrid_1440`, `Hybrid_1440_Fast`, `Hybrid_1080`, `Hybrid_4K`, `Full_1440`, `Full_1080`.
+
+<details><summary>Older versions (v0.3 - v0.4)</summary>
 
 **New in v0.4:**
 - **NVIDIA's new DLSS 5 model** (nvngx_dlssnr.dll 310.9.16) is used automatically: about **2x lighter**, ~10 ms per network run at 960x540 on an RX 6900 XT (v0.3: 24 ms). The old 310.8 DLL still works with the old model.
@@ -44,6 +90,8 @@ This mod makes it run on **AMD Radeon RX 6000** graphics cards (RDNA2).
 **New in v0.3:** up to 60 FPS without frame generation on an RX 6900 XT, even frame pacing, no more stutter
 in fast games, HDR fix (no more white characters), clean 2 passes, safe setup with backup and uninstaller.
 See [CHANGELOG.md](CHANGELOG.md).
+
+</details>
 
 ## Does my PC work?
 
@@ -146,24 +194,19 @@ upscaler that says **w/Dx12** (for example `FSR 2.2.1 w/Dx12`) and restart the g
 ## Choosing a look
 
 The folder `presets` has complete settings files. To switch, copy one over `nr_port.ini` in the game folder and restart the game.
+The package `nr_port.ini` is **Hybrid_1440** with `model_res=auto` (it follows your output size).
 
-| Preset | Look | FPS on an RX 6900 XT (est.) | When to use it |
+| Preset | Look | Network time per frame, RX 6900 XT | When to use it |
 |---|---|---|---|
-| **Standard** (default) | NVIDIA's default look, 960x540 model | ~43 (baseline) | Start here |
-| **Strong** | Clearly stronger light and faces, still clean | ~43 (no extra cost) | Standard looks too subtle |
-| **Cinematic** | Strong + NVIDIA's Cinematic style: strongest, graded look | ~43 (no extra cost) | Screenshots, slow games |
-| **HighQuality_720p** | 1280x720 model: faces and skin much closer to the full-resolution result | ~40 | You have fps to spare |
-| **HiRes_1080p** | 1920x1080 model, finer detail | ~33 | Image quality first |
-| **Native_1440p** | Network at full 1440p | ~26 | Comparison, screenshots |
-| **Performance** | 640x360 model, softer | ~45-50 | Weaker GPUs, fast games |
-| **Community** | `compose=nv`, `pass2_gain=1`: for NVIDIA multipass setups copied from NVIDIA users | per pass about as Standard; 2 passes cost more | You use OptiScaler's 2 passes |
+| **Hybrid_1440** (default) | Near-full DLSS 5 look: detail at 1440p, main network 1.5x smaller, split over 2 frames | ~15 ms (network 29.7 ms) | 1440p screens. Cyberpunk: ~35 FPS |
+| **Hybrid_1440_Fast** | Same, split over 3 frames | ~10 ms | More FPS (~45 FPS in Cyberpunk), people in motion can shimmer more |
+| **Hybrid_1080** | Hybrid at 1080p | ~9 ms (network 18.2 ms) | 1080p screens, or more FPS |
+| **Hybrid_4K** | Hybrid at 2160p, split over 3 | heavy | 4K screens |
+| **Full_1440** / **Full_1080** | Whole network at full size (NVIDIA's layout): most detail | ~24 / ~13 ms (network 48 / 26 ms) | Screenshots, best image |
+| `classic/*` | The old 360p-720p presets | 3-8 ms | Weak GPUs; **only a fraction of the effect** |
 
-FPS: Fallout 4 at 1440p, network split over 3 frames; only Standard is measured in a game, the others are estimated from the
-network time (RX 6900 XT, per network run: 7.3 / 10.6 / 16.5 / 32.6 / 56.5 ms at 360p / 540p / 720p / 1080p / 1440p).
-Every preset has `edit_temporal=0.7` (new in v0.4.3): it removes most of the remaining flicker at no cost.
-
-**Tip:** for the most realistic look, use Style **Cinematic** together with a higher model resolution: copy `Cinematic.ini`
-and set `model_res=1280x720` (or `1920x1080` if you have the fps).
+All presets use the new model (nvngx_dlssnr.dll 310.9.16). With the old 310.8 DLL the classic plans in `nr_data_h15` are used (no hybrid).
+Combine with **FSR 4.1** (official on RX 6000 since driver 26.10.1) at Quality or Balanced: the network works on the upscaled picture, so a better upscaler means a better DLSS 5 result.
 
 The OptiScaler NR sliders (intensity, style, local tone, local structure, skin) now change the image live. A key in `nr_port.ini` (e.g. `local_tone=0.5`) overrides the slider.
 
@@ -173,11 +216,11 @@ Works with nvngx_dlssnr.dll 310.8 (old model) and 310.9.16 (new, ~2x lighter mod
 
 The game keeps running with its normal image. `dlssnr_nr.log` then says "has a different model than this port supports (310.8 / 310.9.16)".
 
-## Best image: NR + FSR 4 on RX 6000
+## Best image: NR + FSR 4.1 on RX 6000
 
-For the best image, combine NR with FSR 4 as the upscaler. FSR 4 does not officially run on RX 6000, but
-[fsr4-shader-performance-overrides](https://github.com/zgauthier2000/fsr4-shader-performance-overrides) makes it work
-there. Get it from that project and follow its instructions; it is not part of this ZIP.
+The network works on the upscaled picture, so a better upscaler means a better DLSS 5 result. Since AMD driver
+**26.10.1** FSR 4.1 is official on RX 6000. In OptiScaler (`OptiScaler.ini`) set `UpscalerIndex = 0` (FSR 4) and
+`Fsr4Preset = 1` (Quality), then pick FSR Quality or Balanced in the game.
 
 ## Known issues (v0.5)
 
@@ -207,10 +250,7 @@ In the game folder, double-click **`Uninstall_DLSS5.bat`** and press `1`. It rem
 
 ## Is this faster or slower?
 
-It costs FPS, but with **v0.4** and NVIDIA's new model it runs well. The AMD card has to do work that NVIDIA cards have special hardware for.
-With the v0.4 defaults (960x540 network, NVIDIA's new model, network split over three frames), measured on an RX 6900 XT in the
-**Cyberpunk 2077 benchmark at 1440p, FSR Quality, no frame generation: 54.7 FPS on High, 85.3 FPS on Low** (v0.3: 43.8 FPS on High).
-First user reports across RX 6000 cards average **about 55 FPS**. Higher network resolutions (presets HiRes / Native) cost more FPS.
+Slower: the network costs GPU time because RX 6000 cards have no AI units. With v0.5 (Hybrid_1440, split over 2 frames) an RX 6900 XT reaches about **35 FPS in Cyberpunk 2077 at 1440p with FSR Quality, with the full DLSS 5 look**. More FPS: `Hybrid_1440_Fast` or `Hybrid_1080`.
 
 ## Who made what?
 
