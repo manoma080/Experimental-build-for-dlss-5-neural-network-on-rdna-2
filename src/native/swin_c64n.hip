@@ -8,7 +8,7 @@
 #include "swin_common.h"
 
 #ifndef WPE
-#define WPE 5
+#define WPE 4
 #endif
 
 typedef const __attribute__((address_space(4))) uint32_t* cwp;

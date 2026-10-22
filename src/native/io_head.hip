@@ -218,6 +218,78 @@ __device__ __forceinline__ f16 vit_exp(float logit) {
 }
 __device__ __forceinline__ size_t tok_byte(int t, int r) { return (size_t)(t >> 4) * 16384 + ch_off(r & ~3) + tok_off(t & 15) + (r & 3); }
 
+#ifdef FAST_ATTN
+// v_dot2 version (not bit-exact: pairs of products per add). Q and K as half2 of e4m3 * 2^-8 (exact), logits = dot2 sum * 2^16;
+// V transposed per channel over key pairs, P = q8(p) as f16, numerator = dot2 sum * 2^8.
+extern "C" __global__ void __launch_bounds__(256) k_attention_n(AttnParams1d P) {
+  __shared__ uint32_t ks[64][17];    // key x 16 channel pairs (+1 pad)
+  __shared__ uint16_t vt[32][66];    // channel x key (f16 bits, e4m3 * 2^-8)
+  __shared__ f16 ps[64][66];
+  const int tid = threadIdx.x, ql = tid & 63, dg = tid >> 6, h = blockIdx.y, qi = blockIdx.x * 64 + ql;
+  uint32_t q[16];
+#pragma unroll
+  for (int i = 0; i < 16; i++) q[i] = qi < P.n ? e4x2((uint32_t)P.q[tok_byte(qi, h * 32 + 2 * i)] | ((uint32_t)P.q[tok_byte(qi, h * 32 + 2 * i + 1)] << 8)) : 0u;
+  float num[8] = {};
+  f16 den = 0;
+  uint32_t kw[2], vw[2];
+  const auto fetch = [&](int g) {
+#pragma unroll
+    for (int u = 0; u < 2; u++) {
+      const int i = tid + 256 * u, key = g * 64 + (i >> 3);
+      const size_t o = tok_byte(key, h * 32 + (i & 7) * 4);
+      kw[u] = key < P.ntok ? *(const uint32_t*)(P.k + o) : 0u;
+      vw[u] = key < P.ntok ? *(const uint32_t*)(P.v + o) : 0u;
+    }
+  };
+  fetch(0);
+  for (int g = 0; g * 64 < P.ntok; g++) {
+    __syncthreads();
+#pragma unroll
+    for (int u = 0; u < 2; u++) {
+      const int i = tid + 256 * u, key = i >> 3, c0 = (i & 7) * 4;
+      const uint2 kk = cvt4(kw[u]), vv = cvt4(vw[u]);
+      ks[key][c0 / 2] = kk.x; ks[key][c0 / 2 + 1] = kk.y;
+      vt[c0][key] = (uint16_t)vv.x; vt[c0 + 1][key] = (uint16_t)(vv.x >> 16); vt[c0 + 2][key] = (uint16_t)vv.y; vt[c0 + 3][key] = (uint16_t)(vv.y >> 16);
+    }
+    __syncthreads();
+    if ((g + 1) * 64 < P.ntok) fetch(g + 1);
+#pragma unroll 4
+    for (int c = 0; c < 16; c++) {
+      const uint32_t* kr = ks[dg * 16 + c];
+      float s = 0.f;
+#pragma unroll
+      for (int i = 0; i < 16; i++) s = dot2(q[i], kr[i], s);
+      ps[ql][dg * 16 + c] = vit_exp(s * 65536.f);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int half = 0; half < 2; half++) {
+      float s[8] = {};
+      for (int cp = half * 16; cp < half * 16 + 16; cp++) {
+        h2 pq; pq.x = (f16)q8((float)ps[ql][2 * cp]); pq.y = (f16)q8((float)ps[ql][2 * cp + 1]);
+        const uint32_t pb = __builtin_bit_cast(uint32_t, pq);
+#pragma unroll
+        for (int j = 0; j < 8; j++) s[j] = dot2(pb, *(const uint32_t*)&vt[dg * 8 + j][2 * cp], s[j]);
+      }
+#pragma unroll
+      for (int j = 0; j < 8; j++) num[j] = (float)(f16)__fadd_rn(num[j], s[j] * 256.f);
+    }
+    f16 acc[8];
+#pragma unroll
+    for (int b = 0; b < 4; b++)
+#pragma unroll
+      for (int c = 0; c < 8; c++) { const f16 pr = ps[ql][b * 16 + c] + ps[ql][b * 16 + c + 8]; acc[c] = b ? (f16)(acc[c] + pr) : pr; }
+    const f16 ev = (f16)((f16)((f16)(acc[0] + acc[2]) + acc[4]) + acc[6]), od = (f16)((f16)((f16)(acc[1] + acc[3]) + acc[5]) + acc[7]);
+    const f16 gs = ev + od;
+    den = g ? (f16)(den + gs) : gs;
+  }
+  if (qi >= P.n) return;
+  const f16 pad = (f16)((float)(P.ntok - P.n) * (float)vit_exp(0.f));
+  const f16 inv = (f16)__fdiv_rn(1.f, fmaxf((float)(f16)(den - pad), 6.198883056640625e-05f));
+#pragma unroll
+  for (int j = 0; j < 8; j++) P.out[tok_byte(qi, h * 32 + dg * 8 + j)] = (uint8_t)e4m3_byte((float)((f16)num[j] * inv));
+}
+#else
 extern "C" __global__ void __launch_bounds__(256) k_attention_n(AttnParams1d P) {
   __shared__ float ks[64][32], vs[64][32];
   __shared__ f16 ps[64][66];   // p[query][key] of the current group (row padded against bank conflicts)
@@ -272,3 +344,4 @@ extern "C" __global__ void __launch_bounds__(256) k_attention_n(AttnParams1d P) 
 #pragma unroll
   for (int j = 0; j < 8; j++) P.out[tok_byte(qi, h * 32 + dg * 8 + j)] = (uint8_t)e4m3_byte((float)((f16)num[j] * inv));
 }
+#endif

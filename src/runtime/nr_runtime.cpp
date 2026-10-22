@@ -55,6 +55,7 @@ struct nr_ctx {
   int devid = 0;   // HIP device of this context; HIP's current device is per thread, so every entry point selects it
   // vit_every motion gate (nr_ext_motion): a reuse frame whose mean |mv| (one vector per bottleneck px, model px, from the DLL at io+mv_off)
   // is above `gate` runs in full instead; f0 = frame of the last gated full run (the cadence restarts there).
+  volatile float last_mv = -1.f;   // mean |mv| (model px) of the newest job start with motion cells, -1 = none yet (nr_ext_last_motion; pipeline motion slice)
   float gate = 0; size_t mv_off = 0; long f0 = 0; float* mvh = nullptr; int H5 = 0, W5 = 0, bs = 0, nx = 0, ny = 0; int checks = 0, gated = 0; double mv_sum = 0;
 };
 #ifndef NR_BUILD_ID
@@ -204,13 +205,20 @@ NR_API nr_ctx* nr_create(const char* data_dir, int width, int height, int vit_ev
   FILE* f = fopen((c->dir + "/manifest.txt").c_str(), "r"); if (!f) FAIL("no manifest.txt");
   { std::string m; if (!nr_load_overrides(c->dir + "/manifest.txt", c->ovr, m)) { fclose(f); FAIL("%s", m.c_str()); } }
   std::map<std::string, hipModule_t> mods; char line[1024];
-  // int8_swin (opt-in, meta int8_swin=1 or env NR_INT8_SWIN=1/0): a native swin step <sym> whose module also exports <sym>_i8
-  // and <sym>_i8_prep runs <sym>_i8. The prep runs once per weight record (kernarg +0x10) at load and fills a 1 MiB buffer
-  // that goes to kernarg +0xa0 (VarParams.scratch, null for native kernels).
-  bool i8 = kv.count("int8_swin") && atoi(kv["int8_swin"].c_str());
-  { char e[8]; if (GetEnvironmentVariableA("NR_INT8_SWIN", e, sizeof e)) i8 = atoi(e) != 0; }
+  // int8_swin (meta int8_swin or env NR_INT8_SWIN): "<m>" for every swin width or "<m64>,<m128>,<m256>" per width
+  // (k_swin_c64 / c128 / c256[s]). A native swin step <sym> whose module also exports <sym>_i8 and <sym>_i8_prep runs
+  // <sym>_i8 (mask 1) or <sym>_i8_<mask> (else falls back to _i8). Mask bits (rdna2/native/swin_var.hip): 1 MLP expand +
+  // qkv, 2 MLP mid, 4 MLP contract, 8 attention out_proj; 0 = all f16. The prep runs once per weight record (kernarg +0x10)
+  // at load and fills a 1 MiB buffer that goes to kernarg +0xa0 (VarParams.scratch, null for native kernels).
+  int i8w[3] = {0, -1, -1};
+  { std::string v = kv.count("int8_swin") ? kv["int8_swin"] : "0"; char e[64];
+    if (GetEnvironmentVariableA("NR_INT8_SWIN", e, sizeof e)) v = e;
+    sscanf(v.c_str(), "%d,%d,%d", &i8w[0], &i8w[1], &i8w[2]);
+    if (i8w[1] < 0) i8w[1] = i8w[0]; if (i8w[2] < 0) i8w[2] = i8w[1];
+    for (int& m : i8w) m = m > 0 ? (m & 15) | 1 : 0; }   // the other bits build on bit 0's int8 x
+  const bool i8 = i8w[0] || i8w[1] || i8w[2];
   std::map<uint64_t, void*> i8rec;
-  if (i8) rlog("int8_swin: on (swin MLP expand on int8 dot4 where the module has _i8 kernels)");
+  if (i8) rlog("int8_swin: c64 %d, c128 %d, c256 %d (mask bits: 1 expand+qkv, 2 mid, 4 contract, 8 out_proj)", i8w[0], i8w[1], i8w[2]);
   const int pre_i = kv.count("pre_step") ? (int)num("pre_step") : -1, post_i = kv.count("post_step") ? (int)num("post_step") : -1;
   bool i8pp = kv.count("int8_prepost") && atoi(kv["int8_prepost"].c_str());
   { char e[8]; if (GetEnvironmentVariableA("NR_INT8_PREPOST", e, sizeof e)) i8pp = atoi(e) != 0; }   // the DLL sets it from the ini
@@ -237,7 +245,11 @@ NR_API nr_ctx* nr_create(const char* data_dir, int width, int height, int vit_ev
     }
     st.gx = atoi(t[4].c_str()); st.gy = atoi(t[5].c_str()); st.thr = atoi(t[6].c_str()); st.gz = t.size() == 8 ? atoi(t[7].c_str()) : 1;
     hipFunction_t f8, p8;
-    if (i8 && st.ka.size() >= 0xa8 && hipModuleGetFunction(&f8, mods[t[0]], (t[1] + "_i8").c_str()) == hipSuccess &&
+    const int i8m = t[1].find("swin_c64") != std::string::npos ? i8w[0] : t[1].find("swin_c128") != std::string::npos ? i8w[1] :
+                    t[1].find("swin_c256") != std::string::npos ? i8w[2] : 0;
+    const std::string i8suf = i8m == 1 ? "_i8" : "_i8_" + std::to_string(i8m);
+    if (i8m && st.ka.size() >= 0xa8 && (hipModuleGetFunction(&f8, mods[t[0]], (t[1] + i8suf).c_str()) == hipSuccess ||
+                                       hipModuleGetFunction(&f8, mods[t[0]], (t[1] + "_i8").c_str()) == hipSuccess) &&
         hipModuleGetFunction(&p8, mods[t[0]], (t[1] + "_i8_prep").c_str()) == hipSuccess) {
       uint64_t w; memcpy(&w, st.ka.data() + 0x10, 8);
       void*& b = i8rec[w];
@@ -452,7 +464,11 @@ NR_API int nr_ext_open(nr_ctx* c, void* io, unsigned long long io_alloc, unsigne
   if (!import_buf(io, io_alloc, io_size, &c->em_io, &c->io) || !import_buf(sig, sig_alloc, sig_size, &c->em_sig, &c->sig)) {
     snprintf(err, errlen, "hipImportExternalMemory (D3D12Resource) failed"); nr_ext_close(c, 0); return 4; }
   c->out_off = out_off; c->flag_off = flag_off; c->io_size = io_size;
-  if (hipStreamCreateWithFlags(&c->s, hipStreamNonBlocking) != hipSuccess || hipStreamCreateWithFlags(&c->ps, hipStreamNonBlocking) != hipSuccess ||
+  // NR_HIP_PRIO=high|low (DLL ini hip_priority): the network stream's priority against the game's D3D12 queues; absent = normal (as before)
+  int lo = 0, hi = 0; char pe[16] = ""; const char* pr = GetEnvironmentVariableA("NR_HIP_PRIO", pe, sizeof pe) ? pe : nullptr; hipDeviceGetStreamPriorityRange(&lo, &hi);   // Win32 env: the DLL sets it at runtime
+  const int prio = pr && !_stricmp(pr, "high") ? hi : pr && !_stricmp(pr, "low") ? lo : 0;
+  if (pr) rlog("runtime: network stream priority %s (%d, range %d..%d)", pr, prio, lo, hi);
+  if ((prio ? hipStreamCreateWithPriority(&c->s, hipStreamNonBlocking, prio) : hipStreamCreateWithFlags(&c->s, hipStreamNonBlocking)) != hipSuccess || hipStreamCreateWithFlags(&c->ps, hipStreamNonBlocking) != hipSuccess ||
       hipHostMalloc((void**)&c->hf, 4) != hipSuccess) { snprintf(err, errlen, "hipStreamCreate failed"); nr_ext_close(c, 0); return 5; }
   c->th = std::thread(ext_thread, c);
   return 0;
@@ -495,6 +511,8 @@ static void motion_step(nr_ctx* c, unsigned seq) {
   if (ok) for (int y = 0; y < c->ny; y++) for (int x = 0; x < c->nx; x++) {
     const float* v = m + 2 * (y * c->W5 + x); const double a = sqrt((double)v[0] * v[0] + (double)v[1] * v[1]); sum += a == a ? a : 1e9; }
   const double mean = sum / ((double)c->nx * c->ny);
+  if (ok) c->last_mv = (float)mean;
+  if (!skipping(c)) return;   // full job anyway: only the measurement (pipeline motion slice)
   if (ok && mean > c->gate) { c->f0 = c->frame; c->gated++; }
   if (ok) c->mv_sum += mean;
   if (++c->checks == 600) { rlog("vit reuse: %d of 600 reuse frames ran in full (motion gate %.2f), mean |mv| %.2f model px", c->gated, c->gate, c->mv_sum / 600); c->checks = c->gated = 0; c->mv_sum = 0; }
@@ -514,12 +532,13 @@ static void ext_thread(nr_ctx* c) {
       Sleep(0);
     }
 #endif
+    LARGE_INTEGER t_in; QueryPerformanceCounter(&t_in);
     // Test hook NR_TEST_DROP_PART=n: treat the n-th job start (part 0/1) as never executed (its flag_in wait timed out)
     static const int drop = getenv("NR_TEST_DROP_PART") ? atoi(getenv("NR_TEST_DROP_PART")) : 0; static int starts = 0;
     if (part <= 1 && ++starts == drop) { ready = false; rlog("runtime: NR_TEST_DROP_PART: job %d (seq %u) dropped", starts, seq); }
     // nr_split: a job whose part 1 was dropped has no input in the arena; its later parts must not run on it (stale arena)
     c->job_ok = part <= 1 ? ready : c->job_ok && ready;
-    if (c->job_ok && part <= 1 && c->mv_off && skipping(c)) motion_step(c, seq);   // vit_motion_gate: a reuse job with too much motion runs in full (the cadence restarts)
+    if (c->job_ok && part <= 1 && c->mv_off) motion_step(c, seq);   // vit_motion_gate: a reuse job with too much motion runs in full (the cadence restarts); every job start: last_mv   // vit_motion_gate: a reuse job with too much motion runs in full (the cadence restarts)
     if (c->job_ok) {   // late/never-executed frame (or a part of a dropped job): skip it; D3D12's bounded spin shows the last edit / native frame
       hipStream_t s = c->s; const size_t n = c->steps.size(); const int* b = c->kb[skipping(c)]; const bool last = part == 0 || part == c->nsplit;   // part j = [kb[j-1], kb[j]); the arena keeps everything in between
       const size_t lo = part > 1 ? (size_t)b[part - 1] : 0, hi = last ? n : (size_t)b[part];
@@ -538,6 +557,8 @@ static void ext_thread(nr_ctx* c) {
              hipMemcpyAsync(c->io + c->out_off, c->d + PAD + c->off_dst, c->dst_size, hipMemcpyDeviceToDevice, s) == hipSuccess;
       ok = ok && hipStreamWriteValue32(s, c->io + c->flag_off, seq, 0) == hipSuccess;
       hipStreamSynchronize(s); if (last) c->frame++;
+      static const bool tl = getenv("NR_TIMELINE") != nullptr;   // test harness timeline (QPC ms, same clock as test_sync's now()): flag_in seen -> job done
+      if (tl) { LARGE_INTEGER f, n; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&n); fprintf(stderr, "TLH %u %d %.3f %.3f\n", seq, part, (double)t_in.QuadPart * 1000.0 / f.QuadPart, (double)n.QuadPart * 1000.0 / f.QuadPart); }
       if (ok && last && ++c->checked == 10) self_check(c);
       if (!ok) fprintf(stderr, "nr_ext: frame %u launch failed\n", seq);
     }
@@ -554,6 +575,7 @@ NR_API int nr_ext_history(nr_ctx* c, unsigned long long hist_in_off, unsigned lo
 // vit_every motion gate (after nr_ext_open): the DLL writes, every NR frame, u32 seq at io+mv_off-16 and one float2 (model px, previous =
 // current + mv) per cell of *cell model px at io+mv_off + (cy * *cells_w + cx) * 8, from the cell's centre pixel. A reuse frame whose mean
 // |mv| > gate runs in full. Returns 1 when this context cannot (not reuse=bottleneck, unknown layout, gate <= 0).
+NR_API float nr_ext_last_motion(nr_ctx* c) { return c ? c->last_mv : -1.f; }   // mean |mv| (model px) at the newest job start, -1 = unknown
 NR_API int nr_ext_motion(nr_ctx* c, unsigned long long mv_off, float gate, unsigned* cell, unsigned* cells_w) {
   if (!c || !c->io || !c->mvh || mv_off < c->src_size + 16 || mv_off % 16 || mv_off + (size_t)c->H5 * c->W5 * 8 > c->io_size || !(gate > 0)) return 1;
   c->mv_off = (size_t)mv_off; c->gate = gate; if (cell) *cell = (unsigned)c->bs; if (cells_w) *cells_w = (unsigned)c->W5;

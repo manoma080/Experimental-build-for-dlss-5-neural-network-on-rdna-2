@@ -1,5 +1,40 @@
 # Changelog (DLSS 5 Neural Rendering, AMD RDNA2 port)
 
+## v0.5.1 (2026-10-22, experimental pre-release)
+
+Same look as v0.5 (the network output is byte-identical), a bit faster, plus a grain filter and a new experimental pipeline mode. The default settings stay safe; the pipeline is opt-in.
+
+**Faster network (output byte-identical to v0.5)**
+- The ViT's global attention now runs on `v_dot2` (packed f16 dot products) instead of scalar f32 multiply-adds: 1.37-1.52 ms -> 0.81-0.83 ms at 1440p. All other kernels already used `v_dot2`/`v_dot4`.
+- Network time, RX 6900 XT, hybrid mode:
+
+| Output | v0.5 | v0.5.1 |
+|---|---|---|
+| 1080p | 17.0 ms | 16.8 ms |
+| 1440p | 28.1 ms | 27.5 ms |
+| 4K | 60.6 ms | 58.1 ms |
+
+**Less static grain (new `edit_temporal_still=0.85`, on by default)**
+- The network turns tiny frame-to-frame changes of the game image (TAA/FSR jitter, ray-tracing noise) into slightly different fine detail every frame. On a still camera this looked like static noise.
+- Where the image stands still and did not change, the edit is now blended more strongly with the previous one. Test (1440p, still camera): white "jumping" pixels -46 %; on motion unchanged.
+- Protected against ghosts: the stronger blend only applies where the pixel does not move, the game image is unchanged and the old and new edit agree (FO4's depth range made the depth test alone useless).
+- `split_fade` now uses a coarse image-change test too, so a character that moves on no longer leaves its old edit behind as a shadow in games like FO4.
+- `edit_temporal_still=0` = v0.5 behaviour.
+
+**New, EXPERIMENTAL: pipeline mode (`pipeline=1`, preset `Hybrid_1440_Pipeline`)**
+- The network runs beside the game instead of inside each frame and uses any idle GPU time; no frame waits for it.
+- Simulated load, 1440p hybrid: CPU-bound game (FO4-like) 53 -> 72 FPS (nr_split 3 vs pipeline), GPU-bound (Cyberpunk-like) 31 -> 36 FPS on a still camera. In-game test FO4: up to ~50 FPS.
+- On fast camera moves the network gets 1.5x more time per frame (`pipeline_motion`, `pipeline_motion_slice`) so the shown edit stays about as young as with nr_split 3.
+- Known issues: more trailing on fast motion than nr_split, and in some games more grain. That is why it is off by default.
+
+**Prepared: DLSS 5 before the upscaler**
+- New hybrid steps 1707x960 and 1280x720 in `nr_data_h15` (13.8 ms / 9.7 ms). With OptiScaler's `RunBeforeSR=true` and FSR Quality the network runs at render resolution: about half the network time; on a still image ~93 % of the fine detail of the normal path. Not yet tested in motion.
+
+**Other**
+- Fixed a build setting that made a fresh build of the c64 kernel 30 % slower than the shipped one (shipped binaries were not affected).
+
+**Upgrade:** copy `nvngx.dll_dlssnr.dll`, `nr_runtime.dll`, `nr_data_h15` and `nr_data` over v0.5, then pick a preset. Your own `nr_port.ini` keeps working; add `edit_temporal_still=0.85` for the grain filter.
+
 ## v0.5 (2026-10-20)
 
 **The DLSS 5 look is finally here.** Every earlier version ran the network at 720p or 540p, so its detail blocks (skin pores, cloth, fine contrast) worked at a quarter of NVIDIA's pixels and the effect looked weak. v0.5 runs them at your output resolution.

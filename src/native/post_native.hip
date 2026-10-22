@@ -319,6 +319,26 @@ __device__ __forceinline__ void post_main(const PostParams& P) {
     uint4 wn;
     if (hc + 8 < 128) wn = wfetch(Wt, hc + 8, t);   // next chunk in flight during this one
 #endif
+#if defined(FAST_ACT) && !defined(NO_FAST_MLP) && !PREW   // activation + e4m3 rounding of two hidden channels at once in packed f16 (not bit-exact)
+    float sj[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+      float s = 0.f;
+#pragma unroll
+      for (int k = 0; k < 16; k++) s = dot2(xq[k], WEXP(j, k), s);
+      sj[j] = s;
+    }
+    h2 ap[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const h2 s = pk(sj[2*j], sj[2*j+1]);
+      const h2 tc = __builtin_elementwise_min(__builtin_elementwise_max(s, (h2){(_Float16)-4.f, (_Float16)-4.f}), (h2){(_Float16)4.f, (_Float16)4.f});
+      const h2 at = __builtin_bit_cast(h2, __builtin_bit_cast(uint32_t, tc) & 0x7FFF7FFFu);
+      const h2 inner = at * (h2){(_Float16)-0.055908203125f, (_Float16)-0.055908203125f} + (h2){(_Float16)0.447265625f, (_Float16)0.447265625f};
+      const h2 g = tc * inner + (h2){(_Float16)0.89453125f, (_Float16)0.89453125f};
+      ap[j] = q8h(s * g);
+    }
+#else
     float a[8];
 #pragma unroll
     for (int j = 0; j < 8; j++) {
@@ -334,6 +354,7 @@ __device__ __forceinline__ void post_main(const PostParams& P) {
     h2 ap[4];
 #pragma unroll
     for (int j = 0; j < 4; j++) ap[j] = pk(a[2*j], a[2*j+1]);
+#endif
 #pragma unroll
     for (int c = 0; c < 32; c++) {
       PREW_ROW();
@@ -373,11 +394,21 @@ __device__ __forceinline__ void post_main(const PostParams& P) {
       if (p == 0) {
         float sc = __fmul_rn(norm_scale(v), Fp[F_HS]);
 #pragma unroll
-        for (int d = 0; d < 32; d += 2) qh[d / 2] = pk(q8(__fmul_rn(v[d], sc)), q8(__fmul_rn(v[d+1], sc)));
+        for (int d = 0; d < 32; d += 2)
+#if defined(FAST_ACT) && !defined(NO_FAST_ATT)
+          qh[d / 2] = q8p(__fmul_rn(v[d], sc), __fmul_rn(v[d+1], sc));
+#else
+          qh[d / 2] = pk(q8(__fmul_rn(v[d], sc)), q8(__fmul_rn(v[d+1], sc)));
+#endif
       } else if (p == 1) {
         float sc = norm_scale(v);
 #pragma unroll
-        for (int d = 0; d < 32; d += 2) Ks[t][d / 2] = pk(q8(__fmul_rn(v[d], sc)), q8(__fmul_rn(v[d+1], sc)));
+        for (int d = 0; d < 32; d += 2)
+#if defined(FAST_ACT) && !defined(NO_FAST_ATT)
+          Ks[t][d / 2] = q8p(__fmul_rn(v[d], sc), __fmul_rn(v[d+1], sc));
+#else
+          Ks[t][d / 2] = pk(q8(__fmul_rn(v[d], sc)), q8(__fmul_rn(v[d+1], sc)));
+#endif
       } else {
         _Float16* vt = (_Float16*)&Vt[0][0];
 #pragma unroll
@@ -416,7 +447,11 @@ __device__ __forceinline__ void post_main(const PostParams& P) {
   float rec = __fdiv_rn(1.f, fmaxf((float)den, 0.00006103515625f));
 #pragma unroll
   for (int j = 0; j < 32; j++)
+#if defined(FAST_ACT) && !defined(NO_FAST_ATT)
+    pp[j] = q8h(pp[j] * (h2){(_Float16)rec, (_Float16)rec});
+#else
     pp[j] = q8p(__fmul_rn((float)pp[j].x, rec), __fmul_rn((float)pp[j].y, rec));
+#endif
 
   // ---- context = P V, stored q8(f16())
   h2 ch[16];
